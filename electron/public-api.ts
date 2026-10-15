@@ -8,6 +8,10 @@ export function toPublicApiRequest(request: ApiRequest) {
     model: request.model,
     cleanVideoUrl: request.cleanVideoUrl,
     outputVideoPath: request.outputVideoPath,
+    imageUrls: request.imageUrls,
+    outputImagePaths: request.outputImagePaths,
+    aspectRatio: request.aspectRatio,
+    resolution: request.resolution,
     createdAt: request.createdAt,
     updatedAt: request.updatedAt,
     finishedAt: request.finishedAt

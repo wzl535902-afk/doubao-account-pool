@@ -59,6 +59,8 @@ const settingsForm = reactive<AppSettings>({
   dailyQuotaLimit: 10,
   miniCost: 2,
   fastCost: 3,
+    standardCost: 5,
+  imageCost: 1,
   dailyResetTime: "00:00",
   generationTimeoutSeconds: 900,
   maxConcurrentAccounts: 4,
@@ -92,7 +94,13 @@ const requestLabels: Record<ApiRequestStatus, string> = {
 
 const modelLabels: Record<DoubaoModel, string> = {
   seedance_2_0_mini: "Seedance 2.0 Mini",
-  seedance_2_0_fast: "Seedance 2.0 Fast"
+  seedance_2_0_fast: "Seedance 2.0 Fast",
+    seedance_2_0: "Seedance 2.0",
+  seedream_5_0_flash: "Seedream 5.0 Flash",
+  seedream_5_0_pro: "Seedream 5.0 Pro",
+  seedream_5_0_lite: "Seedream 5.0 Lite",
+  seedream_4_5: "Seedream 4.5",
+  seedream_4_0: "Seedream 4.0"
 };
 
 const modalRemainingQuota = computed(() =>
@@ -156,8 +164,12 @@ const accountQuotaSummary = computed(() => {
       (sum, account) => sum + remainingGenerations(account, "seedance_2_0_mini"),
       0
     ),
-    fastRuns: accounts.value.reduce(
+        fastRuns: accounts.value.reduce(
       (sum, account) => sum + remainingGenerations(account, "seedance_2_0_fast"),
+      0
+    ),
+    standardRuns: accounts.value.reduce(
+      (sum, account) => sum + remainingGenerations(account, "seedance_2_0"),
       0
     )
   };
@@ -185,7 +197,7 @@ const filteredAccounts = computed(() => {
 const apiExample = computed(() => {
   const port = settingsForm.apiPort || 17888;
   const token = settingsForm.apiKey || "local-doubao-key";
-  return `# 共享额度：账号每日 ${settingsForm.dailyQuotaLimit}，Mini 每次扣 ${settingsForm.miniCost}，Fast 每次扣 ${settingsForm.fastCost}
+  return `# 共享额度：账号每日 ${settingsForm.dailyQuotaLimit}，Mini 每次扣 ${settingsForm.miniCost}，Fast 每次扣 ${settingsForm.fastCost}，标准(1080P) 每次扣 ${settingsForm.standardCost}
 curl -X POST http://127.0.0.1:${port}/api/generate \\
   -H "Authorization: Bearer ${token}" \\
   -F "model=seedance_2_0_mini" \\
@@ -319,6 +331,7 @@ async function saveSettings() {
     dailyQuotaLimit: Number(settingsForm.dailyQuotaLimit),
     miniCost: Number(settingsForm.miniCost),
     fastCost: Number(settingsForm.fastCost),
+    standardCost: Number(settingsForm.standardCost),
     generationTimeoutSeconds: Number(settingsForm.generationTimeoutSeconds),
     maxConcurrentAccounts: Number(settingsForm.maxConcurrentAccounts),
     retryCount: Number(settingsForm.retryCount)
@@ -474,7 +487,7 @@ function quotaUsedPercent(account: Account) {
 }
 
 function remainingGenerations(account: Account, model: DoubaoModel) {
-  const cost = model === "seedance_2_0_mini" ? Number(settingsForm.miniCost) : Number(settingsForm.fastCost);
+  const cost = model === "seedance_2_0_mini" ? Number(settingsForm.miniCost) : model === "seedance_2_0" ? Number(settingsForm.standardCost) : Number(settingsForm.fastCost);
   return Math.floor(account.quotaRemaining / Math.max(1, cost || 1));
 }
 
@@ -609,6 +622,10 @@ onBeforeUnmount(() => {
           <span>Fast 预计</span>
           <strong>{{ accountQuotaSummary.fastRuns }} 次</strong>
         </div>
+        <div role="listitem" title="全部剩余额度只用于标准(1080P)时的预计次数；与 Mini/Fast 预计次数不可相加">
+          <span>标准 预计</span>
+          <strong>{{ accountQuotaSummary.standardRuns }} 次</strong>
+        </div>
       </div>
 
       <div class="account-toolbar">
@@ -686,6 +703,7 @@ onBeforeUnmount(() => {
                 <div class="quota-models">
                   <span>Mini 可生成 {{ remainingGenerations(account, 'seedance_2_0_mini') }} 次</span>
                   <span>Fast 可生成 {{ remainingGenerations(account, 'seedance_2_0_fast') }} 次</span>
+                  <span>标准 可生成 {{ remainingGenerations(account, 'seedance_2_0') }} 次</span>
                 </div>
               </td>
               <td class="last-used-cell" :title="fullTime(account.lastUsedAt)">{{ formatRelativeTime(account.lastUsedAt) }}</td>
@@ -750,6 +768,7 @@ onBeforeUnmount(() => {
             <select v-model="settingsForm.defaultModel">
               <option value="seedance_2_0_mini">{{ modelLabels.seedance_2_0_mini }}</option>
               <option value="seedance_2_0_fast">{{ modelLabels.seedance_2_0_fast }}</option>
+              <option value="seedance_2_0">{{ modelLabels.seedance_2_0 }}</option>
             </select>
           </label>
           <label>
@@ -763,6 +782,10 @@ onBeforeUnmount(() => {
           <label>
             <span>Fast 单次消耗</span>
             <input v-model.number="settingsForm.fastCost" type="number" min="1" />
+          </label>
+          <label>
+            <span>标准 单次消耗</span>
+            <input v-model.number="settingsForm.standardCost" type="number" min="1" />
           </label>
           <label>
             <span>每日重置时间</span>
@@ -1094,7 +1117,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="quota-note">
-          Mini 每次消耗 {{ settingsForm.miniCost }} 额度；Fast 每次消耗 {{ settingsForm.fastCost }} 额度。账号池首页只读显示，避免误改。
+          Mini 每次消耗 {{ settingsForm.miniCost }} 额度；Fast 每次消耗 {{ settingsForm.fastCost }} 额度；标准(1080P) 每次消耗 {{ settingsForm.standardCost }} 额度。账号池首页只读显示，避免误改。
         </div>
 
         <div class="modal-actions">

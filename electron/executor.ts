@@ -18,8 +18,15 @@ import {
   isQuotaNotChargedFailure,
   normalizeComparableText
 } from "./doubao-page-state.js";
+import {
+  extractFallbackApis,
+  formatNomarkMeta,
+  resolveUnwatermarkedVideo,
+  type NomarkVideoInfo
+} from "./doubao-nomark.js";
 import { toPublicApiRequest } from "./public-api.js";
-import type { Account, ApiRequest, ApiRequestStatus, AppSettings, DoubaoModel } from "./types.js";
+import type { Account, ApiRequest, ApiRequestStatus, AppSettings, DoubaoImageModel, DoubaoModel } from "./types.js";
+import { IMAGE_PAGE_MODEL_NAMES, isImageModel } from "./types.js";
 import { resolveCleanVideoUrl, verifyDoubaoShareVideoResource } from "./watermark.js";
 
 type DataChangedCallback = () => void;
@@ -32,6 +39,9 @@ type QueueItem = {
 
 type ShareRecoveryResult = {
   shareUrl: string | null;
+  directVideoUrl: string | null;
+  cleanVideoUrl: string | null;
+  nomarkInfo: NomarkVideoInfo | null;
   candidateCount: number;
   promptMatchCount: number;
   generatedMatchCount: number;
@@ -75,7 +85,7 @@ const clipboardMutex = new AsyncMutex();
 const SHARE_PANEL_WAIT_MS = 3500;
 const CLIPBOARD_WAIT_MS = 2800;
 const CALLBACK_TIMEOUT_MS = 5000;
-const VIDEO_CARD_WAIT_MS = 15000;
+const VIDEO_CARD_WAIT_MS = 25000;
 const callbackQueues = new Map<string, Promise<void>>();
 
 export class DoubaoExecutor {
@@ -137,7 +147,7 @@ export class DoubaoExecutor {
 
       win = this.createExecutionWindow(account, settings);
       await loadUrl(win, settings.doubaoChatUrl || "https://www.doubao.com/chat");
-      await wait(2500);
+      await waitForDoubaoPageSettled(win);
       await dismissDoubaoDesktopDownloadPrompt(win);
 
       if (await looksLoggedOut(win)) {
@@ -213,7 +223,7 @@ export class DoubaoExecutor {
     const settings = this.database.getSettings();
     let win: BrowserWindow | null = null;
     let submittedToDoubao = false;
-    let keepWindowOpen = false;
+    let accountBlocked = false; // 账号被阻断（未登录/验证码）：不亮窗、不保活，处置统一走「账号管理」
 
     try {
       await this.updateProgress({
@@ -225,7 +235,7 @@ export class DoubaoExecutor {
 
       win = this.createExecutionWindow(account, settings);
       await loadUrl(win, settings.doubaoChatUrl || "https://www.doubao.com/chat");
-      await wait(2500);
+      await waitForDoubaoPageSettled(win);
       await dismissDoubaoDesktopDownloadPrompt(win);
 
       if (await looksLoggedOut(win)) {
@@ -234,11 +244,17 @@ export class DoubaoExecutor {
           loginStatus: "logged_out",
           currentStatus: "login_required"
         });
-        keepWindowOpen = true;
-        if (!win.isVisible()) {
-          win.show();
-        }
-        throw new Error("豆包账号未登录，已打开登录窗口，请登录后重试");
+        accountBlocked = true;
+        throw new Error("豆包账号未登录，请到「账号管理」重新登录该账号后再试");
+      }
+
+      if (isImageModel(request.model)) {
+        await this.runImagePipeline(request, account, settings, win, () => {
+          submittedToDoubao = true;
+        });
+        this.database.updateAccount({ id: account.id, currentStatus: "idle" });
+        if (settings.autoCloseExecutorWindow) win.close();
+        return;
       }
 
       await this.updateProgress({
@@ -248,13 +264,18 @@ export class DoubaoExecutor {
       });
       await activateVideoMode(win, request.model);
 
-      if (request.referenceImagePath) {
+      const referenceImagePaths = request.referenceImagePaths?.length
+        ? request.referenceImagePaths
+        : request.referenceImagePath
+          ? [request.referenceImagePath]
+          : [];
+      if (referenceImagePaths.length) {
         await this.updateProgress({
           requestId,
           status: "running",
-          message: "正在上传参考图"
+          message: `正在上传参考图（共 ${referenceImagePaths.length} 张）`
         });
-        await uploadReferenceImage(win, request.referenceImagePath);
+        await uploadReferenceImages(win, referenceImagePaths);
       }
 
       await this.updateProgress({
@@ -264,6 +285,14 @@ export class DoubaoExecutor {
       });
       await fillPrompt(win, request.prompt);
 
+      // 提交前最后核验：输入框必须有内容（冷窗口竞态兜底，最多再补种两次）
+      for (let guard = 0; guard < 2; guard += 1) {
+        const preflight = await inspectComposer(win, request.prompt);
+        if (preflight.textLength > 0) break;
+        await wait(1500);
+        await fillPrompt(win, request.prompt);
+      }
+
       await this.updateProgress({
         requestId,
         status: "running",
@@ -272,6 +301,7 @@ export class DoubaoExecutor {
       const generationBaseline = await inspectGenerationPage(win);
       await submitPromptAndWait(win, request.model, request.prompt);
       submittedToDoubao = true;
+      await confirmVideoGenerationIfNeeded(win);
       const submittedConversationUrl = await waitForSubmittedConversationUrl(win);
       if (submittedConversationUrl) {
         await this.updateProgress({
@@ -302,43 +332,57 @@ export class DoubaoExecutor {
         }
       );
 
-      if (!generationResult.shareUrl) {
+      if (!request.removeWatermark) {
+        // 未启用去水印：直接下载豆包视频直链（原始视频，含水印）
+        const rawVideoUrl = generationResult.directVideoUrl || null;
+        if (!rawVideoUrl) {
+          throw new Error("视频已生成，但未捕获到视频直链，无法下载原始视频");
+        }
+        const rawOutputVideoPath = await downloadRawVideoIfNeeded(settings, requestId, rawVideoUrl);
+        await this.updateProgress({
+          requestId,
+          status: "success",
+          message: rawOutputVideoPath
+            ? "视频生成完成（原始视频，未去水印），已保存到本地"
+            : "视频生成完成（原始视频，未去水印），已获取视频直链（未配置保存目录）",
+          doubaoThreadUrl: generationResult.shareUrl,
+          rawVideoUrl,
+          cleanVideoUrl: null,
+          outputVideoPath: rawOutputVideoPath
+        });
+        this.database.updateAccount({ id: account.id, currentStatus: "idle" });
+        if (settings.autoCloseExecutorWindow) {
+          win.close();
+        }
+        return;
+      }
+
+      if (!generationResult.cleanVideoUrl) {
         throw new Error(
-          `视频已生成，但未提取到豆包分享链接，无法获取去水印视频${generationResult.shareFailureReason ? `（${generationResult.shareFailureReason}）` : ""}`
+          `视频已生成，但未能解析无水印原片地址${generationResult.shareFailureReason ? `（兜底分享：${generationResult.shareFailureReason}）` : ""}`
         );
       }
 
+      const unwatermarkedUrl = generationResult.cleanVideoUrl;
       this.recordOperation(
         requestId,
-        "复制分享地址",
+        "解析无水印原片",
         "success",
-        "已复制并确认豆包分享页包含视频资源",
-        generationResult.shareUrl
+        `已从豆包获取无水印原画（${formatNomarkMeta(generationResult.nomarkInfo)}）`,
+        unwatermarkedUrl
       );
 
-      if (!request.removeWatermark) {
-        throw new Error("接口仅返回去水印视频，本次请求未启用去水印");
-      }
-
-      const resolvedVideo = await this.resolveCleanVideoForVerifiedShare(
-        requestId,
-        settings,
-        generationResult.shareUrl
-      );
-      const doubaoThreadUrl = resolvedVideo.shareUrl;
-      const cleanVideo = resolvedVideo.cleanVideo;
-      const cleanVideoUrl = cleanVideo.url;
-      const outputVideoPath = await downloadCleanVideoIfNeeded(settings, requestId, cleanVideoUrl);
+      const outputVideoPath = await downloadCleanVideoIfNeeded(settings, requestId, unwatermarkedUrl);
 
       await this.updateProgress({
         requestId,
         status: "success",
         message: outputVideoPath
-          ? `视频生成完成，去水印 MP4 已验证并保存到本地（${formatWatermarkResolution(cleanVideo)}）`
-          : `视频生成完成，去水印 MP4 地址已验证（${formatWatermarkResolution(cleanVideo)}）`,
-        doubaoThreadUrl,
+          ? `视频生成完成，无水印原画已保存到本地（${formatNomarkMeta(generationResult.nomarkInfo)}）`
+          : `视频生成完成，无水印原片地址已获取（未配置保存目录）（${formatNomarkMeta(generationResult.nomarkInfo)}）`,
+        doubaoThreadUrl: submittedConversationUrl,
         rawVideoUrl: null,
-        cleanVideoUrl,
+        cleanVideoUrl: unwatermarkedUrl,
         outputVideoPath
       });
       this.database.updateAccount({ id: account.id, currentStatus: "idle" });
@@ -347,20 +391,144 @@ export class DoubaoExecutor {
         win.close();
       }
     } catch (error) {
-      const shouldRefundQuota = !submittedToDoubao || isRefundableExecutionError(error);
+      let failure = error;
+      if (win && !win.isDestroyed() && !accountBlocked && (await withTimeout(isDoubaoCaptchaVisible(win).catch(() => false), 6000, false))) {
+        // 验证码处置统一走「账号管理」：不亮窗、不保活；重登该账号后会话自动同步回号池
+        failure = new Error("账号触发字节风控验证码（人机验证），请到「账号管理」重新登录该豆包账号后再试");
+        accountBlocked = true;
+      }
+      const shouldRefundQuota = !submittedToDoubao || isRefundableExecutionError(failure);
       if (shouldRefundQuota) {
         this.database.refundQuota(account.id, request.model);
       }
-      await this.failRequest(request, errorMessage(error), shouldRefundQuota);
+      await this.failRequest(request, errorMessage(failure), shouldRefundQuota);
       this.database.updateAccount({
         id: account.id,
-        currentStatus: keepWindowOpen ? "login_required" : "idle"
+        currentStatus: accountBlocked ? "login_required" : "idle"
       });
       this.onDataChanged();
-      if (win && !settings.showExecutorWindow && !keepWindowOpen && !win.isDestroyed()) {
+      if (win && !win.isDestroyed() && settings.autoCloseExecutorWindow) {
         win.close();
       }
     }
+  }
+
+  private async runImagePipeline(
+    request: ApiRequest,
+    account: Account,
+    settings: AppSettings,
+    win: BrowserWindow,
+    onSubmitted: () => void
+  ) {
+    const requestId = request.requestId;
+    await this.updateProgress({ requestId, status: "running", message: "正在切换豆包图像生成模式" });
+
+    const activation = await activateImageMode(win, request.model as DoubaoImageModel);
+    if (!activation.modelApplied) {
+      this.recordOperation(
+        requestId,
+        "图像模型选择",
+        "info",
+        `未在页面找到「${activation.targetName}」，当前页面模型「${activation.currentModel || "默认"}」；页面可选：${activation.options.join(" / ") || "未枚举到"}`
+      );
+    }
+
+    await this.updateProgress({ requestId, status: "running", message: "正在设置出图比例" });
+    const ratioApplied = await applyImageRatio(win, request.aspectRatio);
+    if (!ratioApplied && request.aspectRatio && !/auto|自动/i.test(request.aspectRatio)) {
+      this.recordOperation(requestId, "图像比例设置", "info", `未命中「${request.aspectRatio}」比例选项，使用页面默认比例`);
+    }
+
+    await installImageCaptureHook(win);
+
+    const total = Math.min(4, Math.max(1, request.imageCount || 1));
+    const perImageTimeoutMs = Math.min(600, Math.max(240, settings.generationTimeoutSeconds)) * 1000;
+    let collected: ImageCaptureSummary = { images: [], usedModel: "", promptRaw: "", captureCount: 0, sawFailure: false };
+    let threadUrl: string | null = null;
+
+    for (let index = 0; index < total; index += 1) {
+      const before = collected.images.length;
+      await this.updateProgress({
+        requestId,
+        status: "running",
+        message: total > 1 ? `正在提交豆包绘制（第 ${index + 1}/${total} 张）` : "正在提交豆包绘制"
+      });
+
+      await fillPrompt(win, request.prompt);
+      for (let guard = 0; guard < 2; guard += 1) {
+        const preflight = await inspectComposer(win, request.prompt);
+        if (preflight.textLength > 0) break;
+        await wait(1500);
+        await fillPrompt(win, request.prompt);
+      }
+
+      const clicked = await clickImageSendButton(win);
+      if (!clicked) {
+        await sendKeyboard(win, "Enter", undefined, 150);
+        await wait(800);
+      }
+      const started = await waitForImageSubmissionStarted(win, 25000);
+      if (!started) {
+        throw new Error("图片提交失败：发送后输入框未清空且未出现生成中状态");
+      }
+      onSubmitted();
+
+      if (!threadUrl) {
+        threadUrl = await waitForSubmittedConversationUrl(win);
+        if (threadUrl) {
+          await this.updateProgress({
+            requestId,
+            status: "running",
+            message: "已记录本次豆包会话地址，等待出图",
+            doubaoThreadUrl: threadUrl
+          });
+        }
+      }
+
+      collected = await waitForGeneratedImages(win, before + 1, perImageTimeoutMs, async (message) => {
+        await this.updateProgress({ requestId, status: "running", message });
+      });
+
+      if (collected.images.length <= before) {
+        if (collected.sawFailure) {
+          throw new Error("豆包返回生成失败提示，未产出图片");
+        }
+        if (index === 0) {
+          throw new Error("等待豆包出图超时，未获取到图片结果");
+        }
+        break;
+      }
+      if (index < total - 1) {
+        await wait(2000);
+      }
+    }
+
+    if (!collected.images.length) {
+      throw new Error("未获取到图片结果");
+    }
+
+    await this.updateProgress({ requestId, status: "running", message: "正在下载无水印原图" });
+    const outputPaths = await downloadGeneratedImages(
+      settings,
+      requestId,
+      collected.images.map((item) => item.url)
+    );
+    for (const image of collected.images) {
+      this.recordOperation(requestId, "解析无水印原图", "success", "已获取 image_ori_raw 无印变体", image.url);
+    }
+
+    const modelNote = collected.usedModel ? `，豆包实际模型：${collected.usedModel}` : "";
+    const partialNote = collected.images.length < total ? `（请求 ${total} 张，实际 ${collected.images.length} 张）` : "";
+    const ratioNote = ratioApplied ? "" : "，比例未命中使用默认";
+    const promptNote = collected.promptRaw ? `，落款=${collected.promptRaw.slice(0, 140)}` : "";
+    await this.updateProgress({
+      requestId,
+      status: "success",
+      message: `图片生成完成，无水印原图 ${collected.images.length} 张${outputPaths.length ? "，已保存到本地" : ""}${modelNote}${ratioNote}${partialNote}${promptNote}`,
+      doubaoThreadUrl: threadUrl,
+      imageUrls: collected.images.map((item) => item.url),
+      outputImagePaths: outputPaths.length ? outputPaths : null
+    });
   }
 
   private async updateProgress(input: Parameters<AppDatabase["updateApiRequest"]>[0]) {
@@ -371,7 +539,7 @@ export class DoubaoExecutor {
       action: operationAction(input.message || "", input.status),
       status: input.status === "failed" ? "failed" : input.status === "success" ? "success" : "info",
       message: input.message || "",
-      targetUrl: input.doubaoThreadUrl || input.rawVideoUrl || input.cleanVideoUrl || null
+      targetUrl: input.doubaoThreadUrl || input.rawVideoUrl || input.cleanVideoUrl || input.imageUrls?.[0] || null
     });
     this.onDataChanged();
     postCallback(updated);
@@ -465,10 +633,18 @@ export class DoubaoExecutor {
 
   private createExecutionWindow(account: Account, settings: AppSettings) {
     const titleName = account.remark || account.name;
-    return new BrowserWindow({
+    const visible = settings.showExecutorWindow;
+    // 豆包页面在 hidden 窗口下会降级（编辑器挂起、上传失败、视频卡片不渲染）：
+    // 默认用"幽灵窗口"——上屏正常渲染（保证视频卡片/媒体懒加载生效），
+    // 但对用户完全不可见（opacity 0）且鼠标事件穿透（不挡任何点击）。
+    const win = new BrowserWindow({
       width: 1320,
       height: 860,
-      show: settings.showExecutorWindow,
+      x: visible ? undefined : 0,
+      y: visible ? undefined : 0,
+      show: true,
+      focusable: visible,
+      skipTaskbar: !visible,
       title: `豆包执行器 - ${titleName}`,
       webPreferences: {
         partition: account.partition,
@@ -478,6 +654,11 @@ export class DoubaoExecutor {
         backgroundThrottling: false
       }
     });
+    if (!visible) {
+      win.setOpacity(0);
+      win.setIgnoreMouseEvents(true);
+    }
+    return win;
   }
 }
 
@@ -514,6 +695,49 @@ async function loadUrl(win: BrowserWindow, url: string, timeoutMs = 30000) {
   });
 }
 
+/** 等待豆包 SPA 水合完成：页面文本+编辑器数量连续稳定后才算就绪（冷窗口兜底）。 */
+async function waitForDoubaoPageSettled(win: BrowserWindow, timeoutMs = 30000) {
+  const startedAt = Date.now();
+  let lastSignature = "";
+  let stableCount = 0;
+  while (Date.now() - startedAt < timeoutMs) {
+    const signature = await runPageScript<string>(win, `
+      (() => {
+        const text = (document.body && document.body.innerText) || "";
+        const editors = document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]').length;
+        return JSON.stringify({ length: text.length, editors, state: document.readyState });
+      })()
+    `).catch(() => "");
+    if (signature && signature === lastSignature) {
+      stableCount += 1;
+      if (stableCount >= 2) {
+        try {
+          const parsed = JSON.parse(signature) as { length: number; editors: number; state: string };
+          if (parsed.length > 200 && parsed.editors >= 1 && parsed.state === "complete") return true;
+        } catch {
+          /* 继续等 */
+        }
+      }
+    } else {
+      stableCount = 0;
+    }
+    lastSignature = signature;
+    await wait(1000);
+  }
+  return false;
+}
+
+/** 字节风控验证码（语义九宫格/滑块）是否正拦在页面上。 */
+async function isDoubaoCaptchaVisible(win: BrowserWindow): Promise<boolean> {
+  return runPageScript<boolean>(win, `
+    (() => {
+      if (document.querySelector('iframe[src*="verifycenter/captcha"], iframe[src*="rmc.bytedance.com"], .vc-captcha-page-container, [class*="captcha-container"], [id*="captcha_container"], [class*="captcha_verify"], [class*="vc-captcha"]')) return true;
+      const text = (document.body && document.body.innerText) || "";
+      return /请完成下列验证后继续|安全验证|完成验证后继续|拖动到下方|拖动图片|请依次点击|滑块验证|完成拼图|请完成验证/.test(text);
+    })()
+  `).catch(() => false);
+}
+
 async function looksLoggedOut(win: BrowserWindow) {
   return runPageScript<boolean>(win, `
     (() => {
@@ -524,30 +748,41 @@ async function looksLoggedOut(win: BrowserWindow) {
   `);
 }
 
-async function uploadReferenceImage(win: BrowserWindow, imagePath: string) {
-  const resolvedPath = path.resolve(imagePath);
-  const stat = await fs.stat(resolvedPath).catch(() => null);
-  if (!stat?.isFile()) {
-    throw new Error(`参考图不存在：${resolvedPath}`);
+async function uploadReferenceImages(win: BrowserWindow, imagePaths: string[]) {
+  const resolvedPaths: string[] = [];
+  for (const imagePath of imagePaths.slice(0, 9)) {
+    const resolvedPath = path.resolve(imagePath);
+    const stat = await fs.stat(resolvedPath).catch(() => null);
+    if (!stat?.isFile()) {
+      throw new Error(`参考图不存在：${resolvedPath}`);
+    }
+    resolvedPaths.push(resolvedPath);
   }
+  if (!resolvedPaths.length) return;
 
-  if (await setFirstFileInput(win, resolvedPath)) {
-    await wait(2500);
+  const settleMs = 2500 + resolvedPaths.length * 700;
+
+  if (await setFileInputFiles(win, resolvedPaths)) {
+    await wait(settleMs);
     return;
   }
 
   await clickByKeywords(win, ["上传", "参考图", "图片", "添加图片", "附件", "image", "upload"]);
   await wait(1200);
 
-  if (await setFirstFileInput(win, resolvedPath)) {
-    await wait(2500);
+  if (await setFileInputFiles(win, resolvedPaths)) {
+    await wait(settleMs);
     return;
   }
 
   throw new Error("没有找到豆包页面的图片上传控件");
 }
 
-async function setFirstFileInput(win: BrowserWindow, filePath: string) {
+async function uploadReferenceImage(win: BrowserWindow, imagePath: string) {
+  await uploadReferenceImages(win, [imagePath]);
+}
+
+async function setFileInputFiles(win: BrowserWindow, filePaths: string[]) {
   const debug = win.webContents.debugger;
   let attachedHere = false;
   try {
@@ -566,7 +801,7 @@ async function setFirstFileInput(win: BrowserWindow, filePath: string) {
     if (!inputs.nodeIds.length) return false;
     await debug.sendCommand("DOM.setFileInputFiles", {
       nodeId: inputs.nodeIds[0],
-      files: [filePath]
+      files: filePaths
     });
     return true;
   } finally {
@@ -577,60 +812,74 @@ async function setFirstFileInput(win: BrowserWindow, filePath: string) {
 }
 
 async function fillPrompt(win: BrowserWindow, prompt: string) {
-  const target = await findComposerTarget(win);
+  const minAcceptableLength = Math.min(8, Math.max(2, prompt.replace(/\s+/g, "").length));
+  for (let round = 0; round < 3; round += 1) {
+    // 豆包弹窗残留会锁死 pointer-events：每轮先清障。
+    await unlockBlockingOverlays(win).catch(() => null);
+    const target = await findComposerTarget(win);
+    if (!target) {
+      await wait(1200);
+      continue;
+    }
 
-  if (!target) {
-    throw new Error("没有找到豆包提示词输入框");
-  }
-
-  const attempts: Array<{ label: string; run: () => Promise<void> }> = [
-    {
-      label: "insertText",
-      run: async () => {
-        await sendMouseClick(win, target.x, target.y);
-        await sendKeyboard(win, "A", ["meta"], 100);
-        await sendKeyboard(win, "Backspace", undefined, 100);
-        await win.webContents.insertText(prompt);
-        await wait(900);
-      }
-    },
-    {
-      label: "clipboardPaste",
-      run: async () => {
-        const before = clipboard.readText();
-        clipboard.writeText(prompt);
-        await sendMouseClick(win, target.x, target.y);
-        await sendKeyboard(win, "A", ["meta"], 100);
-        await sendKeyboard(win, "Backspace", undefined, 100);
-        await sendKeyboard(win, "V", ["meta"], 900);
-        if (clipboard.readText() === prompt) {
-          clipboard.writeText(before);
+    const attempts: Array<{ label: string; run: () => Promise<void> }> = [
+      {
+        label: "insertText",
+        run: async () => {
+          await sendMouseClick(win, target.x, target.y);
+          await sendKeyboard(win, "A", [process.platform === "darwin" ? "meta" : "control"], 100);
+          await sendKeyboard(win, "Backspace", undefined, 100);
+          await win.webContents.insertText(prompt);
+          await wait(900);
+        }
+      },
+      {
+        label: "clipboardPaste",
+        run: async () => {
+          const before = clipboard.readText();
+          clipboard.writeText(prompt);
+          await sendMouseClick(win, target.x, target.y);
+          const selectAllModifiers: Array<"control" | "meta"> = [process.platform === "darwin" ? "meta" : "control"];
+          await sendKeyboard(win, "A", selectAllModifiers, 100);
+          await sendKeyboard(win, "Backspace", undefined, 100);
+          await sendKeyboard(win, "V", selectAllModifiers, 900);
+          if (clipboard.readText() === prompt) {
+            clipboard.writeText(before);
+          }
+        }
+      },
+      {
+        label: "domInput",
+        run: async () => {
+          await setComposerTextDirectly(win, prompt);
+          await wait(900);
         }
       }
-    },
-    {
-      label: "domInput",
-      run: async () => {
-        await setComposerTextDirectly(win, prompt);
-        await wait(900);
-      }
-    }
-  ];
+    ];
 
-  const tried: string[] = [];
-  for (const attempt of attempts) {
-    tried.push(attempt.label);
-    await attempt.run();
-    const diagnostics = await inspectComposer(win, prompt);
-    if (diagnostics.promptPresent) return;
+    const tried: string[] = [];
+    for (const attempt of attempts) {
+      tried.push(attempt.label);
+      try {
+        await attempt.run();
+      } catch {
+        /* 换下一招 */
+      }
+      await wait(400);
+      const diagnostics = await inspectComposer(win, prompt);
+      if (diagnostics.promptPresent && diagnostics.textLength >= minAcceptableLength) return;
+    }
+    await wait(1000);
   }
 
   const diagnostics = await inspectComposer(win, prompt);
-  throw new Error(`豆包输入框没有真正接收本次提示词（已尝试 ${tried.join("、")}；${formatComposerDiagnostics(diagnostics)}）`);
+  throw new Error(`豆包输入框没有真正接收本次提示词（已重试 3 轮；${formatComposerDiagnostics(diagnostics)}）`);
 }
 
 async function findComposerTarget(win: BrowserWindow) {
-  return runPageScript<{ x: number; y: number; debug: string } | null>(win, `
+  // 冷窗口兜底：编辑器可能渲染较晚，最多等 ~14 秒
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const target = await runPageScript<{ x: number; y: number; debug: string } | null>(win, `
     (() => {
       const visible = (el) => {
         const rect = el.getBoundingClientRect();
@@ -664,6 +913,10 @@ async function findComposerTarget(win: BrowserWindow) {
       };
     })()
   `);
+    if (target) return target;
+    await wait(700);
+  }
+  return null;
 }
 
 async function setComposerTextDirectly(win: BrowserWindow, prompt: string) {
@@ -708,16 +961,586 @@ async function setComposerTextDirectly(win: BrowserWindow, prompt: string) {
 }
 
 async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
-  const target = model === "seedance_2_0_mini" ? "Mini" : "Fast";
-  await clickByKeywords(win, ["视频生成"]);
+  const isStandard = model === "seedance_2_0";
+  const target = isStandard ? "Seedance 2.0" : model === "seedance_2_0_mini" ? "Mini" : "Fast";
+  const isVideoModeActive = async () =>
+    runPageScript<boolean>(win, `
+      (() => {
+        const text = document.body ? document.body.innerText : "";
+        return /Seedance/.test(text);
+      })()
+    `);
+  const diag = (msg: string) =>
+    runPageScript<boolean>(win, `(() => { try { window.__vidDiag = window.__vidDiag || []; window.__vidDiag.push(${JSON.stringify(msg)}); } catch (e) {} return true; })()`);
+  const clickByTextRealmouse = async (text: string, minX: number) => {
+    const point = await exactTextPoint(win, text, minX);
+    if (!point) return false;
+    await sendMouseClick(win, point.x, point.y);
+    return true;
+  };
+
+  // 冷窗口兜底：先等输入框出现（页面就绪信号），最多等 ~14 秒
+  await findComposerTarget(win);
+  await unlockBlockingOverlays(win).catch(() => null);
+  await diag("start:" + String(win.webContents.getURL() || "").slice(0, 90));
+  for (let round = 0; round < 3; round += 1) {
+    if (await isVideoModeActive()) {
+      await diag(`r${round}:already-active`);
+      return;
+    }
+
+    // 2026-10 豆包改版：首页「视频生成」入口收进「更多技能」面板；
+    // JS el.click() 对新版控件（div 面板项）实测无效，必须真实鼠标坐标事件。
+    const m1 = await clickByTextRealmouse("更多技能", 0);
+    await diag(`r${round}:更多技能=${m1}`);
+    await wait(1000);
+    const panel = await runPageScript<boolean>(win, `(() => /视频生成/.test(document.body ? document.body.innerText : ""))()`);
+    await diag(`r${round}:panelHasEntry=${panel}`);
+    const m2 = await clickByTextRealmouse("视频生成", 280);
+    await diag(`r${round}:视频生成=${m2}`);
+    await wait(1200);
+    const m3 = await runPageScript<boolean>(win, `
+      (() => {
+        const btn = Array.from(document.querySelectorAll("button")).find((item) => {
+          const text = String(item.textContent || "").trim();
+          return text.indexOf("模型") === 0 || /^Seedance/.test(text);
+        });
+        if (!btn) return false;
+        const rect = btn.getBoundingClientRect();
+        if (rect.width < 10 || rect.height < 10) return false;
+        window.__vidChip = { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) };
+        return true;
+      })()
+    `);
+    await diag(`r${round}:模型chip找到=${m3}`);
+    const chip = await runPageScript<{ x: number; y: number } | null>(win, "(() => (window.__vidChip || null))()");
+    if (chip) {
+      await sendMouseClick(win, chip.x, chip.y);
+    }
+    await wait(800);
+    if (isStandard) {
+      // 标准档菜单项 = 精确文案「Seedance 2.0」：包含匹配会误中 Fast/Mini 子串。
+      const m4 = await clickByTextRealmouse("Seedance 2.0", 280);
+      await diag(`r${round}:标准档=${m4}`);
+    } else {
+      // Mini/Fast 菜单项为「Seedance 2.0 Fast快速出片选择」等组合文案：无精确叶子节点，用包含匹配。
+      const m4 = await clickByKeywords(win, [target, model === "seedance_2_0_mini" ? "mini" : "fast"]);
+      await diag(`r${round}:档位${target}=${m4}`);
+    }
+    if (isStandard) {
+      // 订阅门槛检测：免费账号点标准档会弹「会员订阅」对话框（锁死页面），必须识别并明确报错。
+      const chip = await readVideoModelChip(win);
+      if (!/Seedance 2\.0/.test(chip) || /Mini|Fast/.test(chip)) {
+        const gate = await unlockBlockingOverlays(win).catch(() => ({ subscriptionBlocked: false }));
+        if (gate.subscriptionBlocked) {
+          throw new Error("豆包账号未开通会员订阅，无法使用「Seedance 2.0」标准档（网页弹出了订阅对话框）");
+        }
+        await clickByKeywords(win, ["Seedance", "模型", "model"]);
+        await wait(800);
+        await clickByTextRealmouse("Seedance 2.0", 280);
+        await wait(1000);
+        const chip2 = await readVideoModelChip(win);
+        if (!/Seedance 2\.0/.test(chip2) || /Mini|Fast/.test(chip2)) {
+          throw new Error("未能切换到「Seedance 2.0」标准档（档位菜单未生效）");
+        }
+      }
+      await diag(`r${round}:standard-verified`);
+    }
+    await wait(1000);
+    if (await isVideoModeActive()) {
+      await diag(`r${round}:active`);
+      return;
+    }
+    await wait(1500);
+  }
+  await diag("failed-all-rounds");
+}
+
+/** 找「文本完全等于」的可见元素中心坐标（可限制最小 x，排除左侧边栏）。 */
+async function exactTextPoint(win: BrowserWindow, text: string, minX = 0) {
+  return runPageScript<{ x: number; y: number } | null>(win, `
+    (() => {
+      const wanted = ${JSON.stringify(text)};
+      const minX = ${JSON.stringify(minX)};
+      const nodes = Array.from(document.querySelectorAll("body *"));
+      const passes = [ (el) => !el.closest("button"), () => true ];
+      for (const accept of passes) {
+        for (const el of nodes) {
+          const content = String(el.textContent || "").trim();
+          if (content !== wanted) continue;
+          if (el.childElementCount > 4) continue;
+          const rect = el.getBoundingClientRect();
+          if (rect.width < 8 || rect.height < 8) continue;
+          if (rect.x < minX) continue;
+          const style = getComputedStyle(el);
+          if (style.visibility === "hidden" || style.display === "none") continue;
+          if (!accept(el)) continue;
+          return { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) };
+        }
+      }
+      return null;
+    })()
+  `);
+}
+
+type ImageCaptureSummary = {
+  images: Array<{ url: string }>;
+  usedModel: string;
+  promptRaw: string;
+  captureCount: number;
+  sawFailure: boolean;
+};
+
+/** 点击「模型」「比例」等图像控制条按钮（真实鼠标事件，兼容隐藏窗口）。 */
+async function clickControlByLabel(win: BrowserWindow, label: string) {
+  const point = await runPageScript<{ x: number; y: number } | null>(win, `
+    (() => {
+      const label = ${JSON.stringify(label)};
+      const btn = Array.from(document.querySelectorAll("button")).find((item) => String(item.textContent || "").trim().indexOf(label) === 0);
+      if (!btn) return null;
+      const rect = btn.getBoundingClientRect();
+      if (rect.width < 10 || rect.height < 10) return null;
+      return { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) };
+    })()
+  `);
+  if (!point) return false;
+  await sendMouseClick(win, point.x, point.y);
+  return true;
+}
+
+/** 读取图像控制条按钮当前文案（如「模型 Seedream 5.0 Flash」「比例 16:9」）。 */
+async function readControlText(win: BrowserWindow, label: string) {
+  return runPageScript<string>(win, `
+    (() => {
+      const label = ${JSON.stringify(label)};
+      const btn = Array.from(document.querySelectorAll("button")).find((item) => String(item.textContent || "").trim().indexOf(label) === 0);
+      return btn ? String(btn.textContent || "").trim() : "";
+    })()
+  `);
+}
+
+/** 读取已展开菜单里的可见短文案（枚举 Seedream 模型 / 比例选项用）。 */
+async function collectControlOptions(win: BrowserWindow): Promise<string[]> {
+  return runPageScript<string[]>(win, `
+    (() => {
+      const out = [];
+      const seen = new Set();
+      for (const el of document.querySelectorAll("body *")) {
+        const content = String(el.textContent || "").trim();
+        if (!content || content.length > 60 || seen.has(content)) continue;
+        const numericRatio = /^[0-9]{1,2}:[0-9]{1,2}/.test(content);
+        if (content.indexOf("Seedream") !== 0 && content.indexOf("即梦") !== 0 && !numericRatio) continue;
+        if (el.closest("button")) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 20 || rect.height < 12 || rect.height > 140) continue;
+        const style = getComputedStyle(el);
+        if (style.visibility === "hidden" || style.display === "none") continue;
+        seen.add(content);
+        out.push(content);
+      }
+      return out.slice(0, 24);
+    })()
+  `);
+}
+
+/** 在展开的菜单里按文案点击选项（优先非按钮元素，避开工具条按钮自身）。 */
+async function clickMenuItemByText(win: BrowserWindow, text: string) {
+  return runPageScript<boolean>(win, `
+    (() => {
+      const wanted = ${JSON.stringify(text)};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 16 && rect.height > 10 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const nodes = Array.from(document.querySelectorAll("body *"));
+      const passes = [ (el) => !el.closest("button"), () => true ];
+      for (const accept of passes) {
+        for (const el of nodes) {
+          const content = String(el.textContent || "").trim();
+          if (!content || content.length > 90) continue;
+          if (content.indexOf(wanted) < 0) continue;
+          if (el.childElementCount > 8) continue;
+          if (!visible(el)) continue;
+          if (!accept(el)) continue;
+          el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    })()
+  `);
+}
+
+/** 切到豆包图像生成模式，并尽量选中目标 Seedream 模型。 */
+async function activateImageMode(win: BrowserWindow, model: DoubaoImageModel) {
+  const targetName = IMAGE_PAGE_MODEL_NAMES[model];
+  const readState = async () =>
+    runPageScript<{ active: boolean; entry: boolean; moreSkills: boolean }>(win, `
+      (() => {
+        const usable = (el) => {
+          const r = el.getBoundingClientRect();
+          const s = getComputedStyle(el);
+          return r.width > 8 && r.height > 8 && s.visibility !== "hidden" && s.display !== "none";
+        };
+        const nodes = Array.from(document.querySelectorAll("button, [role=button], div, span"));
+        const active = nodes.some((el) => {
+          const t = String(el.textContent || "").trim();
+          return t.length <= 44 && t.indexOf("模型") === 0 && t.indexOf("Seedream") >= 0 && usable(el);
+        });
+        const entry = nodes.some((el) => {
+          const t = String(el.textContent || "").trim();
+          return t === "图像生成" && usable(el);
+        });
+        const moreSkills = nodes.some((el) => {
+          const t = String(el.textContent || "").trim();
+          return t === "更多技能" && usable(el);
+        });
+        return { active, entry, moreSkills };
+      })()
+    `);
+
+  const clickEntry = async (label: string) => {
+    const point = await runPageScript<{ x: number; y: number } | null>(win, `
+      (() => {
+        const label = ${JSON.stringify(label)};
+        const leaf = Array.from(document.querySelectorAll("button, [role=button], div, span")).find((el) => {
+          const t = String(el.textContent || "").trim();
+          if (t !== label) return false;
+          const r = el.getBoundingClientRect();
+          const s = getComputedStyle(el);
+          return r.width > 8 && r.height > 8 && s.visibility !== "hidden" && s.display !== "none";
+        });
+        if (!leaf) return null;
+        const btn = leaf.closest("button, [role=button]") || leaf;
+        const r = btn.getBoundingClientRect();
+        if (r.width < 8 || r.height < 8) return null;
+        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+      })()
+    `);
+    if (point) {
+      await sendMouseClick(win, point.x, point.y);
+      return true;
+    }
+    return clickByKeywords(win, [label]);
+  };
+
+  await findComposerTarget(win);
+  let state = await readState();
+  for (let round = 0; round < 4 && !state.active; round += 1) {
+    if (state.entry) {
+      await clickEntry("图像生成");
+    } else if (state.moreSkills) {
+      await clickEntry("更多技能");
+      await wait(1200);
+      await clickEntry("图像生成");
+    }
+    await wait(2200);
+    state = await readState();
+  }
+  if (!state.active) {
+    const diag = await runPageScript<string>(win, `
+      (() => {
+        const visible = (el) => {
+          const r = el.getBoundingClientRect();
+          const s = getComputedStyle(el);
+          return r.width > 4 && r.height > 4 && s.visibility !== "hidden" && s.display !== "none";
+        };
+        const texts = [];
+        for (const b of document.querySelectorAll("button, [role=button]")) {
+          if (!visible(b)) continue;
+          const t = String(b.textContent || "").replace(/\\s+/g, " ").trim();
+          if (t && t.length <= 26) texts.push(t);
+        }
+        const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [class*="modal"]')).filter(visible).length;
+        return JSON.stringify({
+          url: String(location.href).slice(0, 90),
+          buttons: Array.from(new Set(texts)).slice(0, 30),
+          dialogs
+        });
+      })()
+    `);
+    try {
+      const shot = await win.webContents.capturePage();
+      await fs.writeFile("D:/doubao-ref/imgmode-debug.png", shot.toPNG());
+    } catch (error) {
+      /* 截图失败不阻塞报错 */
+    }
+    throw new Error(`未能切换到豆包图像生成模式；现场=${diag || "无诊断"}`);
+  }
+
+  const currentModel = await readControlText(win, "模型");
+  if (currentModel.indexOf(targetName) >= 0) {
+    return { modelApplied: true, targetName, currentModel, options: [] as string[] };
+  }
+
+  let options: string[] = [];
+  let modelApplied = false;
+  const opened = await clickControlByLabel(win, "模型");
+  if (opened) {
+    await wait(1200);
+    options = await collectControlOptions(win);
+    console.log("[图像] Seedream 模型选项：", options.join(" / ") || "(未枚举到)");
+    const clicked = await clickMenuItemByText(win, targetName);
+    await wait(800);
+    if (clicked) {
+      const after = await readControlText(win, "模型");
+      modelApplied = after.indexOf(targetName) >= 0;
+    }
+    if (!modelApplied) {
+      await sendKeyboard(win, "Escape", undefined, 120);
+      await wait(400);
+    }
+  }
+  const finalModel = await readControlText(win, "模型");
+  return { modelApplied, targetName, currentModel: finalModel || currentModel, options };
+}
+
+/** 设置出图比例（找不到目标项时保持页面默认，返回 false）。 */
+async function applyImageRatio(win: BrowserWindow, aspectRatio: string | null) {
+  const raw = String(aspectRatio || "").trim().replace("：", ":");
+  if (!raw || /^(auto|自动|默认)$/i.test(raw)) return true;
+  const candidates = ["21:9", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "1:1"];
+  const wanted = candidates.find((item) => raw.indexOf(item) >= 0);
+  if (!wanted) return false;
+  const current = await readControlText(win, "比例");
+  if (current.indexOf(wanted) >= 0) return true;
+  const opened = await clickControlByLabel(win, "比例");
+  if (!opened) return false;
+  await wait(1200);
+  const ratioOptions = await collectControlOptions(win);
+  console.log("[图像] 比例菜单选项：", ratioOptions.join(" / ") || "(未枚举到)");
+  const clicked = await clickMenuItemByText(win, wanted);
   await wait(800);
-  await clickByKeywords(win, ["Seedance", "模型", "model"]);
-  await wait(500);
-  await clickByKeywords(win, [target, model === "seedance_2_0_mini" ? "mini" : "fast"]);
-  await wait(500);
+  if (!clicked) {
+    await sendKeyboard(win, "Escape", undefined, 120);
+    return false;
+  }
+  const after = await readControlText(win, "比例");
+  return after.indexOf(wanted) >= 0;
+}
+
+/** 安装 /chat/completion 抓包钩子（fetch + XHR），结果存入 window.__poolImgCap。 */
+async function installImageCaptureHook(win: BrowserWindow) {
+  await runPageScript<string>(win, `
+    (() => {
+      if (window.__poolImgCapInstalled) return "already";
+      window.__poolImgCapInstalled = true;
+      window.__poolImgCap = [];
+      const record = (url, text) => {
+        try {
+          window.__poolImgCap.push({ url: String(url).slice(0, 200), len: text.length, text });
+          if (window.__poolImgCap.length > 24) window.__poolImgCap.shift();
+        } catch (error) {}
+      };
+      const origFetch = window.fetch;
+      window.fetch = function (...args) {
+        const pending = origFetch.apply(this, args);
+        try {
+          const reqUrl = (args[0] && (args[0].url || args[0])) || "";
+          if (String(reqUrl).indexOf("/chat/completion") >= 0) {
+            pending.then((resp) => {
+              try {
+                const clone = resp.clone();
+                clone.text().then((t) => record(reqUrl, t)).catch(() => {});
+              } catch (error) {}
+            }).catch(() => {});
+          }
+        } catch (error) {}
+        return pending;
+      };
+      const OX = window.XMLHttpRequest;
+      const origOpen = OX.prototype.open;
+      const origSend = OX.prototype.send;
+      OX.prototype.open = function (method, url, ...rest) {
+        this.__capUrl = url;
+        return origOpen.call(this, method, url, ...rest);
+      };
+      OX.prototype.send = function (...args) {
+        try {
+          if (String(this.__capUrl || "").indexOf("/chat/completion") >= 0) {
+            this.addEventListener("load", () => {
+              try { record(this.__capUrl, String(this.responseText || "")); } catch (error) {}
+            });
+          }
+        } catch (error) {}
+        return origSend.apply(this, args);
+      };
+      return "installed";
+    })()
+  `);
+}
+
+/** 从窗口抓包缓存提取 image_ori_raw（无印）URL 列表。 */
+async function collectImageCaptures(win: BrowserWindow): Promise<ImageCaptureSummary> {
+  const raw = await runPageScript<{ urls: string[]; modelRaw: string; promptRaw: string; captureCount: number; sawFailure: boolean }>(win, `
+    (() => {
+      const caps = window.__poolImgCap || [];
+      const urls = [];
+      const seen = new Set();
+      let modelRaw = "";
+      let promptRaw = "";
+      let sawFailure = false;
+      const FAIL_HINTS = ["生成失败", "无法生成", "未通过审核", "换个描述"];
+      for (const cap of caps) {
+        const text = String(cap.text || "");
+        if (!modelRaw) {
+          const mi = text.indexOf("Seedream");
+          if (mi >= 0) modelRaw = text.slice(mi, mi + 40);
+        }
+        if (!promptRaw) {
+          const pi = text.indexOf("user_input_content");
+          if (pi >= 0) promptRaw = text.slice(pi, pi + 260);
+        }
+        if (!sawFailure && FAIL_HINTS.some((hint) => text.indexOf(hint) >= 0)) sawFailure = true;
+        let cursor = -1;
+        while ((cursor = text.indexOf("image_ori_raw", cursor + 1)) >= 0) {
+          const hi = text.indexOf("https:", cursor);
+          if (hi < 0 || hi - cursor > 400) continue;
+          let j = hi;
+          while (j < text.length) {
+            const code = text.charCodeAt(j);
+            if (code === 92 && text.charCodeAt(j + 1) === 34) break;
+            if (code === 34 || code === 39 || code === 10 || code === 13) break;
+            j += 1;
+          }
+          const candidate = text.slice(hi, j);
+          if (candidate.length < 30) continue;
+          const key = candidate.slice(-70);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          urls.push(candidate);
+        }
+      }
+      return { urls, modelRaw, promptRaw, captureCount: caps.length, sawFailure };
+    })()
+  `);
+  const summary: ImageCaptureSummary = {
+    images: [],
+    usedModel: "",
+    promptRaw: "",
+    captureCount: raw?.captureCount || 0,
+    sawFailure: Boolean(raw?.sawFailure)
+  };
+  const backslash = String.fromCharCode(92);
+  const decode = (value: string) =>
+    value.split(backslash + "u002F").join("/").split(backslash + "/").join("/").replace(/&amp;/g, "&");
+  summary.images = (raw?.urls || []).map((item) => ({ url: decode(item) }));
+  const cleaned = String(raw?.modelRaw || "").replace(/[^0-9A-Za-z. ]+/g, " ").split(" ").filter(Boolean).slice(0, 3).join(" ");
+  if (cleaned.indexOf("Seedream") === 0) {
+    summary.usedModel = cleaned.slice(0, 34);
+  }
+  summary.promptRaw = String(raw?.promptRaw || "");
+  return summary;
+}
+
+/** 给 promise 加超时护栏（页面被风控冻住时不至于整条链挂死）。 */
+function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms))
+  ]);
+}
+
+/** 轮询等待新图片完成（以 image_ori_raw 入库为准）。 */
+async function waitForGeneratedImages(
+  win: BrowserWindow,
+  minCount: number,
+  timeoutMs: number,
+  onProgress: (message: string) => Promise<void>
+): Promise<ImageCaptureSummary> {
+  const deadline = Date.now() + timeoutMs;
+  const emptySummary = (): ImageCaptureSummary => ({
+    images: [],
+    usedModel: "",
+    promptRaw: "",
+    captureCount: 0,
+    sawFailure: false
+  });
+  let summary = (await withTimeout(collectImageCaptures(win), 30000, null)) ?? emptySummary();
+  let lastReport = 0;
+  while (Date.now() < deadline && summary.images.length < minCount) {
+    if (await withTimeout(isDoubaoCaptchaVisible(win).catch(() => false), 6000, false)) {
+      throw new Error("账号触发字节风控验证码（人机验证），请到「账号管理」重新登录该豆包账号后再试");
+    }
+    if (Date.now() - lastReport > 15000) {
+      lastReport = Date.now();
+      await onProgress(`豆包绘制中：已捕获 ${summary.images.length} 张无水印原图`);
+    }
+    await wait(3000);
+    const next = await withTimeout(collectImageCaptures(win), 30000, null);
+    if (next === null) {
+      throw new Error("豆包页面长时间无响应（疑似被风控验证拦截），请到「账号管理」重新登录该豆包账号后再试");
+    }
+    summary = next;
+  }
+  return summary;
+}
+
+/** 点击图像模式的发送按钮（data-testid=chat_input_send_button）。 */
+async function clickImageSendButton(win: BrowserWindow) {
+  const point = await runPageScript<{ x: number; y: number } | null>(win, `
+    (() => {
+      const btn = document.querySelector('[data-testid="chat_input_send_button"]');
+      if (!btn) return null;
+      const rect = btn.getBoundingClientRect();
+      if (rect.width < 6 || rect.height < 6) return null;
+      return { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) };
+    })()
+  `);
+  if (!point) return false;
+  await sendMouseClick(win, point.x, point.y);
+  return true;
+}
+
+/** 核验图片请求已提交（输入框清空或出现生成中状态）。 */
+async function waitForImageSubmissionStarted(win: BrowserWindow, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const state = await runPageScript<{ editorEmpty: boolean; generating: boolean }>(win, `
+      (() => {
+        const editor = document.querySelector('.tiptap.ProseMirror, [contenteditable="true"]');
+        const editorText = editor ? String(editor.textContent || "").trim() : "";
+        const bodyText = document.body ? String(document.body.innerText || document.body.textContent || "") : "";
+        const generating = bodyText.indexOf("正在生成") >= 0 || bodyText.indexOf("生成中") >= 0 || bodyText.indexOf("正在绘制") >= 0;
+        return { editorEmpty: editorText.length === 0, generating };
+      })()
+    `);
+    if (state && (state.editorEmpty || state.generating)) return true;
+    await wait(1200);
+  }
+  return false;
+}
+
+/** 下载无印原图到本地输出目录。 */
+async function downloadGeneratedImages(settings: AppSettings, requestId: string, urls: string[]) {
+  if (!settings.outputDir.trim() || !urls.length) return [] as string[];
+  await fs.mkdir(settings.outputDir, { recursive: true });
+  const paths: string[] = [];
+  for (let index = 0; index < urls.length; index += 1) {
+    const response = await fetch(urls[index]);
+    if (!response.ok) {
+      throw new Error(`下载无水印图片失败：HTTP ${response.status}`);
+    }
+    const contentType = (response.headers.get("content-type") || "").toLowerCase();
+    const ext = contentType.indexOf("jpeg") >= 0 ? "jpg" : contentType.indexOf("webp") >= 0 ? "webp" : contentType.indexOf("heic") >= 0 ? "heic" : "png";
+    const name = urls.length > 1 ? `${requestId}-${index + 1}.${ext}` : `${requestId}.${ext}`;
+    const outputPath = path.join(settings.outputDir, name);
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (!bytes.length) {
+      throw new Error("下载到的图片文件为空");
+    }
+    await fs.writeFile(outputPath, bytes);
+    paths.push(outputPath);
+  }
+  return paths;
 }
 
 async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel, prompt: string) {
+  if (await isDoubaoCaptchaVisible(win)) {
+    throw new Error("账号触发字节风控验证码（人机验证），请到「账号管理」重新登录该账号后再试");
+  }
   const baselineText = await getPageText(win);
   const attempts: Array<{ label: string; run: () => Promise<boolean> }> = [
     {
@@ -771,11 +1594,70 @@ async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel, promp
     if (result.confirmed || result.sentEvidence) return;
   }
 
-  const modelLabel = model === "seedance_2_0_mini" ? "Seedance 2.0 Mini" : "Seedance 2.0 Fast";
+  const modelLabel = model === "seedance_2_0_mini" ? "Seedance 2.0 Mini" : model === "seedance_2_0" ? "Seedance 2.0" : "Seedance 2.0 Fast";
   const diagnostics = await inspectComposer(win);
   throw new Error(
     `没有看到豆包提交确认文案：本次使用 ${modelLabel} 生成；已尝试 ${tried.join("、") || "无可用发送动作"}；${formatComposerDiagnostics(diagnostics)}`
   );
+}
+
+async function confirmVideoGenerationIfNeeded(win: BrowserWindow, timeoutMs = 45000) {
+  // 新版豆包在提交后先回复“请先确认参数……确认后我再开始生成视频”，
+  // 需要再发一条确认消息后才会真正开始生成。
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const pageText = await getPageText(win);
+    if (/视频生成中|正在生成视频|正在生成/.test(pageText)) {
+      return true;
+    }
+    const needsConfirm = /请先确认参数|确认后我再开始生成视频|确认后.{0,8}开始生成/.test(pageText);
+    if (needsConfirm) {
+      await unlockBlockingOverlays(win).catch(() => null);
+      // 实测坑：发送按钮为无 aria-label 的图标钮，单纯点一次可能命中不可交互状态；
+      // 必须以「输入框清空」作为已发送凭据，失败换法重试（点击 → 键盘回车）。
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await fillPrompt(win, "确认，开始生成");
+        const sendPoint = await findComposerSendButtonPoint(win);
+        if (sendPoint) {
+          await sendMouseClick(win, sendPoint.x, sendPoint.y);
+        }
+        await wait(2200);
+        let composerText = "";
+        try {
+          composerText = await runPageScript<string>(win, `
+            (() => {
+              const ta = document.querySelector('textarea, [contenteditable="true"], [role="textbox"]');
+              return ta ? String(ta.textContent || ta.value || "") : "";
+            })()
+          `);
+        } catch (error) {
+          composerText = "";
+        }
+        if (!composerText.includes("确认")) {
+          return true;
+        }
+        // 仍是未发出状态：键盘回车兜底，再校验一轮。
+        await sendKeyboard(win, "Enter", undefined, 0);
+        await wait(1800);
+        try {
+          composerText = await runPageScript<string>(win, `
+            (() => {
+              const ta = document.querySelector('textarea, [contenteditable="true"], [role="textbox"]');
+              return ta ? String(ta.textContent || ta.value || "") : "";
+            })()
+          `);
+        } catch (error) {
+          composerText = "";
+        }
+        if (!composerText.includes("确认")) {
+          return true;
+        }
+      }
+      return true;
+    }
+    await wait(1000);
+  }
+  return false;
 }
 
 async function sendKeyboard(
@@ -784,10 +1666,50 @@ async function sendKeyboard(
   modifiers?: Array<"control" | "meta">,
   settleMs = 700
 ) {
-  win.webContents.sendInputEvent({ type: "keyDown", keyCode, modifiers });
-  await wait(80);
-  win.webContents.sendInputEvent({ type: "keyUp", keyCode, modifiers });
-  await wait(settleMs);
+  // 隐藏窗口下 sendInputEvent 的键盘事件不会被页面处理；改用 CDP 注入
+  const debug = win.webContents.debugger;
+  let attachedHere = false;
+  try {
+    if (!debug.isAttached()) {
+      debug.attach("1.3");
+      attachedHere = true;
+    }
+    const windowsVirtualKeyCode =
+      keyCode === "Enter"
+        ? 13
+        : keyCode === "ESC" || keyCode === "Escape"
+          ? 27
+          : keyCode === "Backspace"
+            ? 8
+            : keyCode === "Delete"
+              ? 46
+              : keyCode.length === 1
+                ? keyCode.toUpperCase().charCodeAt(0)
+                : 0;
+    const cdpModifiers =
+      (modifiers?.includes("control") ? 2 : 0) | (modifiers?.includes("meta") ? 4 : 0);
+    const key = keyCode === "Enter" ? "Enter" : keyCode === "ESC" ? "Escape" : keyCode === "Backspace" ? "Backspace" : keyCode;
+    await debug.sendCommand("Input.dispatchKeyEvent", {
+      type: "rawKeyDown",
+      windowsVirtualKeyCode,
+      nativeVirtualKeyCode: windowsVirtualKeyCode,
+      key,
+      modifiers: cdpModifiers
+    });
+    await wait(80);
+    await debug.sendCommand("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      windowsVirtualKeyCode,
+      nativeVirtualKeyCode: windowsVirtualKeyCode,
+      key,
+      modifiers: cdpModifiers
+    });
+    await wait(settleMs);
+  } finally {
+    if (attachedHere && debug.isAttached()) {
+      try { debug.detach(); } catch { /* ignore */ }
+    }
+  }
 }
 
 async function inspectComposer(win: BrowserWindow, expectedPrompt = "") {
@@ -906,11 +1828,24 @@ async function findComposerSendButtonPoint(win: BrowserWindow) {
 }
 
 async function sendMouseClick(win: BrowserWindow, x: number, y: number) {
-  win.webContents.sendInputEvent({ type: "mouseMove", x, y });
-  await wait(80);
-  win.webContents.sendInputEvent({ type: "mouseDown", x, y, button: "left", clickCount: 1 });
-  await wait(80);
-  win.webContents.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount: 1 });
+  // 隐藏窗口下 sendInputEvent 的鼠标事件不会被页面处理；改用 CDP 注入
+  const debug = win.webContents.debugger;
+  let attachedHere = false;
+  try {
+    if (!debug.isAttached()) {
+      debug.attach("1.3");
+      attachedHere = true;
+    }
+    await debug.sendCommand("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+    await wait(60);
+    await debug.sendCommand("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
+    await wait(60);
+    await debug.sendCommand("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+  } finally {
+    if (attachedHere && debug.isAttached()) {
+      try { debug.detach(); } catch { /* ignore */ }
+    }
+  }
 }
 
 async function waitForSubmissionStarted(
@@ -920,9 +1855,13 @@ async function waitForSubmissionStarted(
   prompt: string,
   timeoutMs = 15000
 ) {
-  const modelLabel = model === "seedance_2_0_mini" ? "Seedance 2.0 Mini" : "Seedance 2.0 Fast";
+  const modelLabel = model === "seedance_2_0_mini" ? "Seedance 2.0 Mini" : model === "seedance_2_0" ? "Seedance 2.0" : "Seedance 2.0 Fast";
   const startedAt = Date.now();
+  const baselineUrl = win.webContents.getURL();
   while (Date.now() - startedAt < timeoutMs) {
+    const currentUrl = win.webContents.getURL();
+    const realConversationUrl = /doubao\.com\/chat\/(?!local_)[A-Za-z0-9._~-]{6,}/i.test(currentUrl)
+      && currentUrl !== baselineUrl;
     const state = await runPageScript<{
       confirmed: boolean;
       sentEvidence: boolean;
@@ -963,7 +1902,8 @@ async function waitForSubmissionStarted(
         const pageChanged = pageText !== baselineText;
         const sentEvidence = !newFailureMessage
           && pageChanged
-          && (hasNewPromptOccurrence(pageText, baselineText, prompt) || composerCleared);
+          && composerCleared
+          && hasNewPromptOccurrence(pageText, baselineText, prompt);
         return {
           confirmed: hasNewTextOccurrence(pageText, baselineText, expected)
             && pageText.includes("视频生成好后")
@@ -978,7 +1918,7 @@ async function waitForSubmissionStarted(
     if (state.failureMessage) {
       return { confirmed: false, sentEvidence: false, failureMessage: state.failureMessage };
     }
-    if (state.confirmed) {
+    if (state.confirmed || realConversationUrl) {
       return { confirmed: true, sentEvidence: true, failureMessage: null };
     }
     if (state.sentEvidence) {
@@ -1005,6 +1945,8 @@ interface GenerationPageState {
 interface GenerationResult {
   shareUrl: string | null;
   directVideoUrl: string | null;
+  cleanVideoUrl?: string | null;
+  nomarkInfo?: NomarkVideoInfo | null;
   shareFailureReason?: string | null;
 }
 
@@ -1023,6 +1965,7 @@ async function waitForGenerationResult(
   const historyFallbackMs = Math.max(30000, Math.min(360000, Math.floor(timeoutMs * 0.6)));
   const startedAt = Date.now();
   let generatedAt = 0;
+  let nomarkReloaded = false;
   let completionTextSeenAt = 0;
   let lastProgressAt = 0;
   let directVideoUrl: string | null = null;
@@ -1031,6 +1974,7 @@ async function waitForGenerationResult(
 
   while (Date.now() - startedAt < timeoutMs) {
     const pageState = await inspectGenerationPage(win);
+    directVideoUrl ||= pageState.directVideoUrl;
     const newFailureMessage = pageState.failureMessage
       && hasNewTextOccurrence(pageState.pageText, baselineText, pageState.failureMessage)
       ? pageState.failureMessage
@@ -1073,6 +2017,27 @@ async function waitForGenerationResult(
       }
       directVideoUrl ||= pageState.directVideoUrl;
 
+      // 关键（2026-10-14 实测）：SPA 流式渲染的消息里没有 fallback_api，整页重载后才有。
+      if (!nomarkReloaded) {
+        nomarkReloaded = true;
+        try {
+          const currentUrl = win.webContents.getURL();
+          if (/\/chat\/\d{6,}/.test(currentUrl)) {
+            await loadUrl(win, currentUrl);
+            await waitForDoubaoPageSettled(win);
+            await wait(1500);
+          }
+        } catch {
+          /* 重载失败则用现页面兜底 */
+        }
+      }
+
+      // 自研去水印：优先直接从页面数据解析无水印原片（无需分享面板/第三方服务）
+      const nomarkInfo = await resolveNomarkCleanVideo(win).catch(() => null);
+      if (nomarkInfo?.url) {
+        return { shareUrl: null, directVideoUrl, cleanVideoUrl: nomarkInfo.url, nomarkInfo };
+      }
+
       const copied = await tryCopyShareLink(win);
       shareFailureReason = copied.reason;
       if (copied.shareUrl) {
@@ -1094,11 +2059,19 @@ async function waitForGenerationResult(
         prompt,
         currentConversationUrl || preferredConversationUrl
       );
+      if (recovery.cleanVideoUrl) {
+        return {
+          shareUrl: recovery.shareUrl,
+          directVideoUrl: directVideoUrl || recovery.directVideoUrl || null,
+          cleanVideoUrl: recovery.cleanVideoUrl,
+          nomarkInfo: recovery.nomarkInfo
+        };
+      }
       if (recovery.shareUrl) {
-        return { shareUrl: recovery.shareUrl, directVideoUrl };
+        return { shareUrl: recovery.shareUrl, directVideoUrl: directVideoUrl || recovery.directVideoUrl || null };
       }
       if (recovery.generatedMatchCount > 0) {
-        return { shareUrl: null, directVideoUrl, shareFailureReason: recovery.shareFailureReason };
+        return { shareUrl: null, directVideoUrl: directVideoUrl || recovery.directVideoUrl || null, shareFailureReason: recovery.shareFailureReason };
       }
       if (originalUrl) {
         await loadUrl(win, originalUrl);
@@ -1126,11 +2099,19 @@ async function waitForGenerationResult(
     prompt,
     extractDoubaoConversationUrl(win.webContents.getURL()) || preferredConversationUrl
   );
+  if (recovery.cleanVideoUrl) {
+    return {
+      shareUrl: recovery.shareUrl,
+      directVideoUrl: directVideoUrl || recovery.directVideoUrl || null,
+      cleanVideoUrl: recovery.cleanVideoUrl,
+      nomarkInfo: recovery.nomarkInfo
+    };
+  }
   if (recovery.shareUrl) {
-    return { shareUrl: recovery.shareUrl, directVideoUrl };
+    return { shareUrl: recovery.shareUrl, directVideoUrl: directVideoUrl || recovery.directVideoUrl || null };
   }
   if (recovery.generatedMatchCount > 0) {
-    return { shareUrl: null, directVideoUrl, shareFailureReason: recovery.shareFailureReason };
+    return { shareUrl: null, directVideoUrl: directVideoUrl || recovery.directVideoUrl || null, shareFailureReason: recovery.shareFailureReason };
   }
   throw new Error(
     `等待豆包视频生成超时；历史链接 ${recovery.candidateCount} 条，提示词匹配 ${recovery.promptMatchCount} 条，未找到已生成视频`
@@ -1161,8 +2142,9 @@ async function inspectGenerationPage(win: BrowserWindow, scrollToLatest = true) 
           image.getAttribute("src"),
           image.getAttribute("data-src")
         ].filter(Boolean).join(" ");
-        return /video[_-]|video.*watermark|video_dsz|tplv[^ ]*video/i.test(source);
+        return /video[_-]|video.*watermark|video_dsz|tplv[^ ]*video|aka\.doubaocdn/i.test(source);
       });
+      const posterCount = Array.from(document.querySelectorAll("xg-poster")).filter(visible).length;
       const videoSourceLists = videos.map((video) => [
         video.currentSrc,
         video.src,
@@ -1190,7 +2172,7 @@ async function inspectGenerationPage(win: BrowserWindow, scrollToLatest = true) 
         videoUrls,
         visibleVideoCount: videos.length,
         playableVideoCount,
-        videoCardCount: videos.length + videoCardImages.length
+        videoCardCount: videos.length + videoCardImages.length + posterCount
       };
     })()
   `);
@@ -1256,6 +2238,7 @@ async function findGeneratedConversationAndCopyShare(
   const requiredSignatureMatches = Math.max(1, Math.ceil(signatures.length * 0.8));
   let promptMatchCount = 0;
   let generatedMatchCount = 0;
+  let recoveryDirectVideoUrl: string | null = null;
   let shareFailureReason: string | null = null;
 
   for (const candidate of orderedCandidates) {
@@ -1291,6 +2274,33 @@ async function findGeneratedConversationAndCopyShare(
       continue;
     }
     generatedMatchCount += 1;
+    recoveryDirectVideoUrl ||= pageState.directVideoUrl || null;
+
+    // 自研去水印优先：直接从页面数据解析无水印原片
+    // 整页重载后再解析（SPA 流式消息无 fallback_api，2026-10-14 实测）
+    try {
+      const recoveryUrl = win.webContents.getURL();
+      if (/\/chat\/\d{6,}/.test(recoveryUrl)) {
+        await loadUrl(win, recoveryUrl);
+        await waitForDoubaoPageSettled(win);
+        await wait(1200);
+      }
+    } catch {
+      /* 忽略，用现页面兜底 */
+    }
+    const recoveryNomark = await resolveNomarkCleanVideo(win).catch(() => null);
+    if (recoveryNomark?.url) {
+      return {
+        shareUrl: null,
+        directVideoUrl: recoveryDirectVideoUrl,
+        cleanVideoUrl: recoveryNomark.url,
+        nomarkInfo: recoveryNomark,
+        candidateCount: orderedCandidates.length,
+        promptMatchCount,
+        generatedMatchCount,
+        shareFailureReason: null
+      };
+    }
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const copied = await tryCopyShareLink(win);
@@ -1298,6 +2308,9 @@ async function findGeneratedConversationAndCopyShare(
       if (copied.shareUrl) {
         return {
           shareUrl: copied.shareUrl,
+          directVideoUrl: recoveryDirectVideoUrl,
+          cleanVideoUrl: null,
+          nomarkInfo: null,
           candidateCount: orderedCandidates.length,
           promptMatchCount,
           generatedMatchCount,
@@ -1310,6 +2323,9 @@ async function findGeneratedConversationAndCopyShare(
 
   return {
     shareUrl: null,
+    directVideoUrl: recoveryDirectVideoUrl,
+    cleanVideoUrl: null,
+    nomarkInfo: null,
     candidateCount: orderedCandidates.length,
     promptMatchCount,
     generatedMatchCount,
@@ -1675,7 +2691,196 @@ async function inspectShareSelection(win: BrowserWindow) {
   `);
 }
 
+/** 页面内提取器：只回传小结果（避免大字符串经 CDP 传输），.toString() 注入免转义风险。 */
+function inPageExtractFallbackApis() {
+  let s = document.documentElement.outerHTML || "";
+  for (let round = 0; round < 4; round += 1) {
+    const next = s
+      .replace(/&quot;/gi, '"')
+      .replace(/&#34;/g, '"')
+      .replace(/&amp;/gi, '&')
+      .replace(/\\u002F/gi, '/')
+      .replace(/\\u0026/gi, '&')
+      .replace(/\\\//g, '/')
+      .replace(/\\\\"/g, '"')
+      .replace(/\\"/g, '"');
+    if (next === s) break;
+    s = next;
+  }
+  const out: Array<{ apiUrl: string; keySeed: string }> = [];
+  const seen: Record<string, boolean> = {};
+  const re = /https:\/\/vas-[a-z0-9-]+\.snssdk\.com\/video\/fplay\/[^\s"'\\<>]+/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s))) {
+    const apiUrl = m[0].replace(/[)\\]+,?$/, "");
+    if (seen[apiUrl]) continue;
+    seen[apiUrl] = true;
+    let keySeed = "";
+    try {
+      keySeed = new URL(apiUrl).searchParams.get("key_seed") || "";
+    } catch {
+      continue;
+    }
+    out.push({ apiUrl, keySeed });
+  }
+  return out;
+}
+
+async function resolveNomarkCleanVideo(win: BrowserWindow): Promise<NomarkVideoInfo | null> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      // 路径一：页面内提取（推荐）
+      const apis = await runPageScript<Array<{ apiUrl: string; keySeed: string }>>(
+        win,
+        `(${inPageExtractFallbackApis.toString()})()`
+      );
+      if (Array.isArray(apis) && apis.length > 0) {
+        for (const { apiUrl, keySeed } of apis) {
+          try {
+            const info = await resolveUnwatermarkedVideo(apiUrl, keySeed);
+            if (info?.url) return info;
+          } catch {
+            /* try next api */
+          }
+        }
+      }
+      // 路径二（保底）：整页 HTML 传回主进程提取
+      const html = await runPageScript<string>(win, "document.documentElement.outerHTML");
+      if (typeof html === "string" && html.length > 500) {
+        const apis2 = extractFallbackApis(html);
+        for (const { apiUrl, keySeed } of apis2) {
+          try {
+            const info = await resolveUnwatermarkedVideo(apiUrl, keySeed);
+            if (info?.url) return info;
+          } catch {
+            /* try next api */
+          }
+        }
+      }
+    } catch (error) {
+      console.warn("[nomark] 无水印解析尝试失败：", errorMessage(error));
+    }
+    await wait(2000);
+  }
+  return null;
+}
+
+async function sendMouseMove(win: BrowserWindow, x: number, y: number, settleMs = 0) {
+  const debug = win.webContents.debugger;
+  let attachedHere = false;
+  try {
+    if (!debug.isAttached()) {
+      debug.attach("1.3");
+      attachedHere = true;
+    }
+    await debug.sendCommand("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+    if (settleMs > 0) await wait(settleMs);
+  } finally {
+    if (attachedHere && debug.isAttached()) {
+      try { debug.detach(); } catch { /* ignore */ }
+    }
+  }
+}
+
+async function hoverGeneratedVideoCard(win: BrowserWindow) {
+  // 悬停视频卡片中部，激活消息工具栏（纯图标：复制/分享/修改/更多）
+  const point = await runPageScript<{ x: number; y: number } | null>(win, `
+    (() => {
+      const cands = [];
+      document.querySelectorAll("img, video, xg-poster").forEach((el) => {
+        const r = el.getBoundingClientRect();
+        const s = getComputedStyle(el);
+        if (r.width < 100 || r.height < 80 || s.visibility === "hidden" || s.display === "none") return;
+        const inMessageArea = r.left > window.innerWidth * 0.2 && r.top > 40 && r.bottom < window.innerHeight - 100;
+        if (!inMessageArea) return;
+        const src = String(el.currentSrc || el.src || s.backgroundImage || "");
+        const isVideoish = /video_dsz|watermark|doubaocdn|xg-poster/i.test(src) || el.tagName === "VIDEO" || el.tagName === "XG-POSTER";
+        cands.push({ x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), score: (isVideoish ? 1000 : 0) + Math.round(r.width) });
+      });
+      cands.sort((a, b) => b.score - a.score);
+      return cands[0] || null;
+    })()
+  `);
+  if (!point) return false;
+  const debug = win.webContents.debugger;
+  let attachedHere = false;
+  try {
+    if (!debug.isAttached()) {
+      debug.attach("1.3");
+      attachedHere = true;
+    }
+    await debug.sendCommand("Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y });
+    await wait(800);
+    return true;
+  } finally {
+    if (attachedHere && debug.isAttached()) {
+      try { debug.detach(); } catch { /* ignore */ }
+    }
+  }
+}
+
+async function waitForToolbarSharePoint(win: BrowserWindow, timeoutMs: number) {
+  const startedAt = Date.now();
+  let point = await findToolbarSharePoint(win);
+  while (!point && Date.now() - startedAt < timeoutMs) {
+    await wait(200);
+    point = await findToolbarSharePoint(win);
+  }
+  return point;
+}
+
+async function findToolbarSharePoint(win: BrowserWindow) {
+  // 消息工具栏 = 一行 3-4 个 24px 图标按钮；顺序 [复制][分享][修改][更多]，取第 2 个。
+  return runPageScript<{ x: number; y: number; count: number } | null>(win, `
+    (() => {
+      const vis = (el) => {
+        const r = el.getBoundingClientRect();
+        const s = getComputedStyle(el);
+        return r.width > 4 && r.height > 4 && s.visibility !== "hidden" && s.display !== "none";
+      };
+      const btns = Array.from(document.querySelectorAll("button"))
+        .filter(vis)
+        .map((el) => {
+          const r = el.getBoundingClientRect();
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), w: Math.round(r.width), h: Math.round(r.height) };
+        })
+        .filter((b) => b.w >= 18 && b.w <= 40 && b.h >= 18 && b.h <= 40 && b.x > window.innerWidth * 0.5 && b.y > 60 && b.y < 520);
+      if (btns.length < 3) return null;
+      const rows = [];
+      for (const b of btns) {
+        let row = rows.find((r) => Math.abs(r.y - b.y) <= 8);
+        if (!row) {
+          row = { y: b.y, items: [] };
+          rows.push(row);
+        }
+        row.items.push(b);
+      }
+      const best = rows.filter((r) => r.items.length >= 3).sort((a, b) => b.items.length - a.items.length)[0];
+      if (!best) return null;
+      best.items.sort((a, b) => a.x - b.x);
+      const share = best.items[Math.min(1, best.items.length - 1)];
+      return { x: share.x, y: share.y, count: best.items.length };
+    })()
+  `);
+}
+
 async function openShareSelection(win: BrowserWindow) {
+  // 新版豆包：悬停视频卡片 → 出现纯图标工具栏 [复制][分享][修改][更多]，
+  // 点第二个（分享）打开"选择对话"分享面板。此已验证路径优先于其他启发式候选。
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const hovered = await hoverGeneratedVideoCard(win);
+    if (hovered) {
+      const toolbarSharePoint = await waitForToolbarSharePoint(win, 4000);
+      if (toolbarSharePoint) {
+        await sendMouseMove(win, toolbarSharePoint.x, toolbarSharePoint.y, 900);
+        await sendMouseClick(win, toolbarSharePoint.x, toolbarSharePoint.y);
+        if ((await waitForShareSelection(win, SHARE_PANEL_WAIT_MS)).active) return true;
+        await sendKeyboard(win, "ESC", undefined, 250);
+      }
+    }
+    await wait(400);
+  }
+
   const cardSharePoint = await waitForVideoCardSharePoint(win, 5000);
   if (cardSharePoint) {
     await sendMouseClick(win, cardSharePoint.x, cardSharePoint.y);
@@ -1990,6 +3195,122 @@ async function clickByKeywords(win: BrowserWindow, keywords: string[]) {
   `);
 }
 
+/** 读取视频模式「模型」chip 当前文案（校验档位切换是否生效）。 */
+async function readVideoModelChip(win: BrowserWindow): Promise<string> {
+  return runPageScript<string>(win, `
+    (() => {
+      const btn = Array.from(document.querySelectorAll("button")).find((item) => {
+        const text = String(item.textContent || "").trim();
+        return (text.indexOf("模型") === 0 || /^Seedance/.test(text)) && (item.offsetWidth || 0) > 40;
+      });
+      return btn ? String(btn.textContent || "").trim() : "";
+    })()
+  `);
+}
+
+/** 检测并解除豆包全屏遮罩/幽灵弹窗（订阅对话框常驻会锁死 pointer-events）。返回是否订阅门槛弹窗。 */
+async function unlockBlockingOverlays(win: BrowserWindow): Promise<{ subscriptionBlocked: boolean }> {
+  return runPageScript<{ subscriptionBlocked: boolean }>(win, `
+    (() => {
+      const result = { subscriptionBlocked: false };
+      try {
+        const dialog = document.querySelector('[role="dialog"][data-state="open"]');
+        if (dialog) {
+          const iframe = dialog.querySelector('iframe');
+          const src = iframe ? String(iframe.getAttribute('src') || '') : '';
+          if (src.indexOf('member/subscription') >= 0) result.subscriptionBlocked = true;
+        }
+        if (!result.subscriptionBlocked) {
+          const anySub = Array.from(document.querySelectorAll('iframe')).some((f) => String(f.getAttribute('src') || '').indexOf('member/subscription') >= 0);
+          if (anySub && (document.querySelector('.bg-dbx-bg-mask') || document.body.getAttribute('data-scroll-locked'))) result.subscriptionBlocked = true;
+        }
+        const masks = Array.from(document.querySelectorAll('.bg-dbx-bg-mask'));
+        for (const mask of masks) {
+          let cur = mask;
+          for (let i = 0; i < 6 && cur; i += 1) {
+            if (cur.getAttribute && cur.getAttribute('data-state') === 'open') {
+              cur.setAttribute('data-state', 'closed');
+              cur.style.display = 'none';
+            }
+            cur = cur.parentElement;
+          }
+          mask.style.display = 'none';
+        }
+        document.body.style.pointerEvents = '';
+        document.body.removeAttribute('data-scroll-locked');
+        const root = document.getElementById('root');
+        if (root) root.removeAttribute('data-biz-setting-modal-open');
+      } catch (error) { /* ignore */ }
+      return result;
+    })()
+  `);
+}
+
+/** 点「更多技能」面板内的「视频生成」入口（2026-10 版豆包；排除左侧边栏的历史会话项）。 */
+async function clickVideoEntry(win: BrowserWindow) {
+  return runPageScript<boolean>(win, `
+    (() => {
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 8 && rect.height > 8 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const nodes = Array.from(document.querySelectorAll("body *"));
+      const passes = [
+        (el) => !el.closest("button") && el.getBoundingClientRect().x > 280,
+        (el) => el.getBoundingClientRect().x > 280
+      ];
+      for (const accept of passes) {
+        for (const el of nodes) {
+          const content = String(el.textContent || "").trim();
+          if (content !== "视频生成") continue;
+          if (el.childElementCount > 4) continue;
+          if (!visible(el)) continue;
+          if (!accept(el)) continue;
+          el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    })()
+  `);
+}
+
+/** 在页面中以内文本「精确等于」点击一个元素（模型档位菜单用；避免子串误命中 Fast/Mini）。 */
+async function clickExactByText(win: BrowserWindow, text: string) {
+  return runPageScript<boolean>(win, `
+    (() => {
+      const wanted = ${JSON.stringify(text)};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 16 && rect.height > 10 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const scopes = [
+        Array.from(document.querySelectorAll('[role="menu"] *, [role="listbox"] *, [data-radix-popper-content-wrapper] *')),
+        Array.from(document.querySelectorAll("body *"))
+      ];
+      const passes = [ (el) => !el.closest("button"), () => true ];
+      for (const scope of scopes) {
+        for (const accept of passes) {
+          for (const el of scope) {
+            const content = String(el.textContent || "").trim();
+            if (content !== wanted) continue;
+            if (el.childElementCount > 4) continue;
+            if (!visible(el)) continue;
+            if (!accept(el)) continue;
+            el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+            el.click();
+            return true;
+          }
+        }
+      }
+      return false;
+    })()
+  `);
+}
+
 async function downloadCleanVideoIfNeeded(settings: AppSettings, requestId: string, cleanVideoUrl: string) {
   if (!settings.outputDir.trim()) return null;
   await fs.mkdir(settings.outputDir, { recursive: true });
@@ -2007,6 +3328,22 @@ async function downloadCleanVideoIfNeeded(settings: AppSettings, requestId: stri
   const bytes = Buffer.from(await response.arrayBuffer());
   if (!bytes.length) {
     throw new Error("下载到的去水印 MP4 文件为空");
+  }
+  await fs.writeFile(outputPath, bytes);
+  return outputPath;
+}
+
+async function downloadRawVideoIfNeeded(settings: AppSettings, requestId: string, rawVideoUrl: string) {
+  if (!settings.outputDir.trim()) return null;
+  await fs.mkdir(settings.outputDir, { recursive: true });
+  const response = await fetch(rawVideoUrl);
+  if (!response.ok) {
+    throw new Error(`下载原始视频失败：HTTP ${response.status}`);
+  }
+  const outputPath = path.join(settings.outputDir, `${requestId}.mp4`);
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (!bytes.length) {
+    throw new Error("下载到的原始视频文件为空");
   }
   await fs.writeFile(outputPath, bytes);
   return outputPath;

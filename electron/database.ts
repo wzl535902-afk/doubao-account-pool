@@ -16,6 +16,7 @@ import type {
   OperationLog,
   OperationLogCreateInput
 } from "./types.js";
+import { modelCost } from "./types.js";
 
 const now = () => new Date().toISOString();
 const OPERATION_LOG_RETENTION_DAYS = 3;
@@ -32,6 +33,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   dailyQuotaLimit: 10,
   miniCost: 2,
   fastCost: 3,
+  standardCost: 5,
+  imageCost: 1,
   dailyResetTime: "00:00",
   generationTimeoutSeconds: 900,
   maxConcurrentAccounts: 4,
@@ -271,7 +274,7 @@ export class AppDatabase {
 
   findAvailableAccount(model: DoubaoModel): Account | undefined {
     const settings = this.getSettings();
-    const requiredQuota = model === "seedance_2_0_mini" ? settings.miniCost : settings.fastCost;
+    const requiredQuota = modelCost(settings, model);
     return this.db.prepare(`
       SELECT
         id,
@@ -309,7 +312,7 @@ export class AppDatabase {
 
   deductQuota(accountId: number, model: DoubaoModel): Account {
     const settings = this.getSettings();
-    const cost = model === "seedance_2_0_mini" ? settings.miniCost : settings.fastCost;
+    const cost = modelCost(settings, model);
     const timestamp = now();
     this.db.prepare(`
       UPDATE accounts
@@ -324,7 +327,7 @@ export class AppDatabase {
 
   refundQuota(accountId: number, model: DoubaoModel): Account {
     const settings = this.getSettings();
-    const cost = model === "seedance_2_0_mini" ? settings.miniCost : settings.fastCost;
+    const cost = modelCost(settings, model);
     const timestamp = now();
     this.db.prepare(`
       UPDATE accounts
@@ -371,6 +374,8 @@ export class AppDatabase {
       dailyQuotaLimit: clampInt(input.dailyQuotaLimit ?? current.dailyQuotaLimit),
       miniCost: Math.max(1, clampInt(input.miniCost ?? current.miniCost)),
       fastCost: Math.max(1, clampInt(input.fastCost ?? current.fastCost)),
+      standardCost: Math.max(1, clampInt(input.standardCost ?? current.standardCost)),
+      imageCost: Math.max(1, clampInt(input.imageCost ?? current.imageCost)),
       generationTimeoutSeconds: clampInt(input.generationTimeoutSeconds ?? current.generationTimeoutSeconds),
       maxConcurrentAccounts: Math.max(1, clampInt(input.maxConcurrentAccounts ?? current.maxConcurrentAccounts)),
       retryCount: clampInt(input.retryCount ?? current.retryCount)
@@ -405,12 +410,18 @@ export class AppDatabase {
         api_requests.message,
         api_requests.prompt,
         api_requests.reference_image_path AS referenceImagePath,
+        api_requests.reference_image_paths AS referenceImagePaths,
         api_requests.remove_watermark AS removeWatermark,
         api_requests.callback_url AS callbackUrl,
         api_requests.doubao_thread_url AS doubaoThreadUrl,
         api_requests.raw_video_url AS rawVideoUrl,
         api_requests.clean_video_url AS cleanVideoUrl,
         api_requests.output_video_path AS outputVideoPath,
+        api_requests.aspect_ratio AS aspectRatio,
+        api_requests.resolution AS resolution,
+        api_requests.image_count AS imageCount,
+        api_requests.image_urls AS imageUrls,
+        api_requests.output_image_paths AS outputImagePaths,
         api_requests.created_at AS createdAt,
         api_requests.updated_at AS updatedAt,
         api_requests.finished_at AS finishedAt
@@ -435,12 +446,18 @@ export class AppDatabase {
         api_requests.message,
         api_requests.prompt,
         api_requests.reference_image_path AS referenceImagePath,
+        api_requests.reference_image_paths AS referenceImagePaths,
         api_requests.remove_watermark AS removeWatermark,
         api_requests.callback_url AS callbackUrl,
         api_requests.doubao_thread_url AS doubaoThreadUrl,
         api_requests.raw_video_url AS rawVideoUrl,
         api_requests.clean_video_url AS cleanVideoUrl,
         api_requests.output_video_path AS outputVideoPath,
+        api_requests.aspect_ratio AS aspectRatio,
+        api_requests.resolution AS resolution,
+        api_requests.image_count AS imageCount,
+        api_requests.image_urls AS imageUrls,
+        api_requests.output_image_paths AS outputImagePaths,
         api_requests.created_at AS createdAt,
         api_requests.updated_at AS updatedAt,
         api_requests.finished_at AS finishedAt
@@ -463,13 +480,17 @@ export class AppDatabase {
         message,
         prompt,
         reference_image_path,
+        reference_image_paths,
         remove_watermark,
         callback_url,
+        aspect_ratio,
+        resolution,
+        image_count,
         created_at,
         updated_at,
         finished_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.requestId,
       input.source || "local-api",
@@ -479,8 +500,12 @@ export class AppDatabase {
       input.message || "",
       input.prompt,
       input.referenceImagePath || null,
+      input.referenceImagePaths?.length ? JSON.stringify(input.referenceImagePaths.slice(0, 9)) : null,
       input.removeWatermark === false ? 0 : 1,
       input.callbackUrl || null,
+      input.aspectRatio || null,
+      input.resolution || null,
+      Math.min(4, Math.max(1, input.imageCount || 1)),
       timestamp,
       timestamp,
       input.status === "failed" || input.status === "success" || input.status === "stopped" ? timestamp : null
@@ -513,6 +538,8 @@ export class AppDatabase {
         raw_video_url = ?,
         clean_video_url = ?,
         output_video_path = ?,
+        image_urls = ?,
+        output_image_paths = ?,
         updated_at = ?,
         finished_at = COALESCE(?, finished_at)
       WHERE request_id = ?
@@ -523,6 +550,12 @@ export class AppDatabase {
       input.rawVideoUrl ?? existing.rawVideoUrl,
       input.cleanVideoUrl ?? existing.cleanVideoUrl,
       input.outputVideoPath ?? existing.outputVideoPath,
+      input.imageUrls === undefined
+        ? (existing.imageUrls ? JSON.stringify(existing.imageUrls) : null)
+        : (input.imageUrls ? JSON.stringify(input.imageUrls) : null),
+      input.outputImagePaths === undefined
+        ? (existing.outputImagePaths ? JSON.stringify(existing.outputImagePaths) : null)
+        : (input.outputImagePaths ? JSON.stringify(input.outputImagePaths) : null),
       now(),
       finishedAt,
       input.requestId
@@ -659,12 +692,18 @@ export class AppDatabase {
   private ensureApiRequestColumns() {
     this.addColumnIfMissing("api_requests", "source", "TEXT NOT NULL DEFAULT 'local'");
     this.addColumnIfMissing("api_requests", "reference_image_path", "TEXT");
+    this.addColumnIfMissing("api_requests", "reference_image_paths", "TEXT");
     this.addColumnIfMissing("api_requests", "remove_watermark", "INTEGER NOT NULL DEFAULT 1");
     this.addColumnIfMissing("api_requests", "callback_url", "TEXT");
     this.addColumnIfMissing("api_requests", "doubao_thread_url", "TEXT");
     this.addColumnIfMissing("api_requests", "raw_video_url", "TEXT");
     this.addColumnIfMissing("api_requests", "clean_video_url", "TEXT");
     this.addColumnIfMissing("api_requests", "output_video_path", "TEXT");
+    this.addColumnIfMissing("api_requests", "aspect_ratio", "TEXT");
+    this.addColumnIfMissing("api_requests", "resolution", "TEXT");
+    this.addColumnIfMissing("api_requests", "image_count", "INTEGER NOT NULL DEFAULT 1");
+    this.addColumnIfMissing("api_requests", "image_urls", "TEXT");
+    this.addColumnIfMissing("api_requests", "output_image_paths", "TEXT");
     this.addColumnIfMissing("api_requests", "finished_at", "TEXT");
   }
 
@@ -680,6 +719,7 @@ export class AppDatabase {
         updated_at = ?,
         finished_at = COALESCE(finished_at, ?)
       WHERE status = 'success'
+        AND model NOT LIKE 'seedream%'
         AND NOT (
           LOWER(COALESCE(clean_video_url, '')) LIKE '%.mp4%'
           OR LOWER(COALESCE(clean_video_url, '')) LIKE '%video_mp4%'
@@ -735,10 +775,41 @@ function isSettingsKey(key: string): key is keyof AppSettings {
   return key in DEFAULT_SETTINGS;
 }
 
+function parseJsonStringArray(value: unknown): string[] | null {
+  if (Array.isArray(value)) return value.map((item) => String(item)).filter(Boolean);
+  if (typeof value === "string" && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed.map((item) => String(item)).filter(Boolean);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 function normalizeApiRequest(row: unknown): ApiRequest {
   const request = row as ApiRequest & { removeWatermark: number | boolean };
+  const rawPaths = (request as { referenceImagePaths?: unknown }).referenceImagePaths;
+  let referenceImagePaths: string[] | null = null;
+  if (Array.isArray(rawPaths)) {
+    referenceImagePaths = rawPaths.map((item) => String(item)).filter(Boolean);
+  } else if (typeof rawPaths === "string" && rawPaths.trim()) {
+    try {
+      const parsed = JSON.parse(rawPaths);
+      if (Array.isArray(parsed)) {
+        referenceImagePaths = parsed.map((item) => String(item)).filter(Boolean);
+      }
+    } catch {
+      referenceImagePaths = null;
+    }
+  }
   return {
     ...request,
+    referenceImagePaths,
+    imageUrls: parseJsonStringArray((request as { imageUrls?: unknown }).imageUrls),
+    outputImagePaths: parseJsonStringArray((request as { outputImagePaths?: unknown }).outputImagePaths),
+    imageCount: Number((request as { imageCount?: unknown }).imageCount ?? 1) || 1,
     removeWatermark: Boolean(request.removeWatermark)
   };
 }
