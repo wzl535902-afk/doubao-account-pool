@@ -192,6 +192,7 @@ export class DoubaoExecutor {
         outputVideoPath
       });
       this.database.updateAccount({ id: account.id, currentStatus: "idle" });
+      this.database.clearAccountCooldown(account.id);
     } catch (error) {
       const message = errorMessage(error);
       await this.failRequest(request, `恢复结果失败：${message}`, false);
@@ -253,6 +254,7 @@ export class DoubaoExecutor {
           submittedToDoubao = true;
         });
         this.database.updateAccount({ id: account.id, currentStatus: "idle" });
+        this.database.clearAccountCooldown(account.id);
         if (settings.autoCloseExecutorWindow) win.close();
         return;
       }
@@ -351,6 +353,7 @@ export class DoubaoExecutor {
           outputVideoPath: rawOutputVideoPath
         });
         this.database.updateAccount({ id: account.id, currentStatus: "idle" });
+        this.database.clearAccountCooldown(account.id);
         if (settings.autoCloseExecutorWindow) {
           win.close();
         }
@@ -386,6 +389,7 @@ export class DoubaoExecutor {
         outputVideoPath
       });
       this.database.updateAccount({ id: account.id, currentStatus: "idle" });
+      this.database.clearAccountCooldown(account.id);
 
       if (settings.autoCloseExecutorWindow) {
         win.close();
@@ -396,6 +400,39 @@ export class DoubaoExecutor {
         // 验证码处置统一走「账号管理」：不亮窗、不保活；重登该账号后会话自动同步回号池
         failure = new Error("账号触发字节风控验证码（人机验证），请到「账号管理」重新登录该豆包账号后再试");
         accountBlocked = true;
+      }
+      // 池宪法④：失败冷却退避 + 自动换号重试（仅可重试类失败，避免重复计费）。
+      if (
+        !accountBlocked &&
+        isRefundableExecutionError(failure) &&
+        settings.requestRetryLimit > 0 &&
+        (request.retryCount ?? 0) < settings.requestRetryLimit
+      ) {
+        this.database.markAccountCooldown(account.id, settings.accountCooldownSeconds);
+        const nextAccount = this.database.reserveAvailableAccount(request.model);
+        if (nextAccount && nextAccount.id !== account.id) {
+          this.database.refundQuota(account.id, request.model);
+          this.database.deductQuota(nextAccount.id, request.model);
+          this.database.markApiRequestRetry(
+            requestId,
+            nextAccount.id,
+            `账号「${account.name}」执行失败（${errorMessage(failure)}），已自动换号重试`
+          );
+          this.database.appendOperationLog({
+            requestId,
+            accountId: nextAccount.id,
+            action: "换号重试",
+            status: "info",
+            message: `已从 ${account.name} 切换到 ${nextAccount.name} 重新执行`
+          });
+          this.database.updateAccount({ id: account.id, currentStatus: accountBlocked ? "login_required" : "idle" });
+          this.onDataChanged();
+          if (win && !win.isDestroyed() && settings.autoCloseExecutorWindow) {
+            win.close();
+          }
+          this.scheduler.enqueue({ key: requestId, requestId, accountId: nextAccount.id, mode: "generate" });
+          return;
+        }
       }
       const shouldRefundQuota = !submittedToDoubao || isRefundableExecutionError(failure);
       if (shouldRefundQuota) {

@@ -39,6 +39,9 @@ const DEFAULT_SETTINGS: AppSettings = {
   generationTimeoutSeconds: 900,
   maxConcurrentAccounts: 4,
   retryCount: 1,
+  accountSelectionMode: "sticky",
+  accountCooldownSeconds: 300,
+  requestRetryLimit: 1,
   autoRemoveWatermark: true,
   watermarkApiUrl: "https://nologo.code24.top/api/water-mask/parse",
   watermarkApiToken: "",
@@ -293,12 +296,16 @@ export class AppDatabase {
       WHERE login_status = 'logged_in'
         AND current_status IN ('idle', 'error')
         AND quota_remaining >= ?
+        AND (cooldown_until IS NULL OR cooldown_until <= ?)
       ORDER BY
-        CASE WHEN last_used_at IS NULL THEN 0 ELSE 1 END ASC,
-        last_used_at ASC,
+        ${
+          settings.accountSelectionMode === "lru"
+            ? "CASE WHEN last_used_at IS NULL THEN 0 ELSE 1 END ASC, last_used_at ASC,"
+            : "last_used_at DESC,"
+        }
         id ASC
       LIMIT 1
-    `).get(requiredQuota) as Account | undefined;
+    `).get(requiredQuota, now()) as Account | undefined;
   }
 
   reserveAvailableAccount(model: DoubaoModel): Account | undefined {
@@ -350,6 +357,32 @@ export class AppDatabase {
     `).run(status, timestamp, timestamp, id);
   }
 
+  /** 池宪法④：失败账号冷却退避（秒）。0=不冷却。 */
+  markAccountCooldown(id: number, seconds: number) {
+    if (!Number.isFinite(seconds) || seconds <= 0) return;
+    const until = new Date(Date.now() + seconds * 1000).toISOString();
+    this.db.prepare(`UPDATE accounts SET cooldown_until = ?, updated_at = ? WHERE id = ?`).run(until, now(), id);
+  }
+
+  /** 成功产片后清冷却（账号已自证健康）。 */
+  clearAccountCooldown(id: number) {
+    this.db.prepare(`UPDATE accounts SET cooldown_until = NULL, updated_at = ? WHERE id = ?`).run(now(), id);
+  }
+
+  /** 池宪法④：请求换号重试（改绑账号、回队列、计数+1）。 */
+  markApiRequestRetry(requestId: string, accountId: number, message: string) {
+    this.db.prepare(`
+      UPDATE api_requests
+      SET account_id = ?,
+          retry_count = COALESCE(retry_count, 0) + 1,
+          status = 'accepted',
+          message = ?,
+          updated_at = ?
+      WHERE request_id = ?
+    `).run(accountId, message, now(), requestId);
+    return this.getApiRequest(requestId)!;
+  }
+
   getSettings(): AppSettings {
     const rows = this.db.prepare("SELECT key, value FROM settings").all() as Array<{ key: string; value: string }>;
     const data = { ...DEFAULT_SETTINGS } as Record<keyof AppSettings, unknown>;
@@ -378,7 +411,10 @@ export class AppDatabase {
       imageCost: Math.max(1, clampInt(input.imageCost ?? current.imageCost)),
       generationTimeoutSeconds: clampInt(input.generationTimeoutSeconds ?? current.generationTimeoutSeconds),
       maxConcurrentAccounts: Math.max(1, clampInt(input.maxConcurrentAccounts ?? current.maxConcurrentAccounts)),
-      retryCount: clampInt(input.retryCount ?? current.retryCount)
+      retryCount: clampInt(input.retryCount ?? current.retryCount),
+      accountSelectionMode: (input.accountSelectionMode ?? current.accountSelectionMode) === "lru" ? "lru" : "sticky",
+      accountCooldownSeconds: Math.max(0, clampInt(input.accountCooldownSeconds ?? current.accountCooldownSeconds)),
+      requestRetryLimit: Math.max(0, clampInt(input.requestRetryLimit ?? current.requestRetryLimit))
     };
 
     const timestamp = now();
@@ -413,6 +449,7 @@ export class AppDatabase {
         api_requests.reference_image_paths AS referenceImagePaths,
         api_requests.remove_watermark AS removeWatermark,
         api_requests.callback_url AS callbackUrl,
+        api_requests.retry_count AS retryCount,
         api_requests.doubao_thread_url AS doubaoThreadUrl,
         api_requests.raw_video_url AS rawVideoUrl,
         api_requests.clean_video_url AS cleanVideoUrl,
@@ -449,6 +486,7 @@ export class AppDatabase {
         api_requests.reference_image_paths AS referenceImagePaths,
         api_requests.remove_watermark AS removeWatermark,
         api_requests.callback_url AS callbackUrl,
+        api_requests.retry_count AS retryCount,
         api_requests.doubao_thread_url AS doubaoThreadUrl,
         api_requests.raw_video_url AS rawVideoUrl,
         api_requests.clean_video_url AS cleanVideoUrl,
@@ -671,6 +709,7 @@ export class AppDatabase {
     this.addColumnIfMissing("accounts", "daily_quota_limit", "INTEGER NOT NULL DEFAULT 10");
     this.addColumnIfMissing("accounts", "quota_remaining", "INTEGER NOT NULL DEFAULT 10");
     this.addColumnIfMissing("accounts", "quota_used_today", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("accounts", "cooldown_until", "TEXT");
     this.addColumnIfMissing("accounts", "mini_daily_limit", "INTEGER NOT NULL DEFAULT 5");
     this.addColumnIfMissing("accounts", "mini_remaining", "INTEGER NOT NULL DEFAULT 5");
     this.addColumnIfMissing("accounts", "mini_used_today", "INTEGER NOT NULL DEFAULT 0");
@@ -695,6 +734,7 @@ export class AppDatabase {
     this.addColumnIfMissing("api_requests", "reference_image_paths", "TEXT");
     this.addColumnIfMissing("api_requests", "remove_watermark", "INTEGER NOT NULL DEFAULT 1");
     this.addColumnIfMissing("api_requests", "callback_url", "TEXT");
+    this.addColumnIfMissing("api_requests", "retry_count", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("api_requests", "doubao_thread_url", "TEXT");
     this.addColumnIfMissing("api_requests", "raw_video_url", "TEXT");
     this.addColumnIfMissing("api_requests", "clean_video_url", "TEXT");

@@ -65,6 +65,9 @@ const settingsForm = reactive<AppSettings>({
   generationTimeoutSeconds: 900,
   maxConcurrentAccounts: 4,
   retryCount: 1,
+  accountSelectionMode: "sticky",
+  accountCooldownSeconds: 300,
+  requestRetryLimit: 1,
   autoRemoveWatermark: true,
   watermarkApiUrl: "https://nologo.code24.top/api/water-mask/parse",
   watermarkApiToken: "",
@@ -334,7 +337,10 @@ async function saveSettings() {
     standardCost: Number(settingsForm.standardCost),
     generationTimeoutSeconds: Number(settingsForm.generationTimeoutSeconds),
     maxConcurrentAccounts: Number(settingsForm.maxConcurrentAccounts),
-    retryCount: Number(settingsForm.retryCount)
+    retryCount: Number(settingsForm.retryCount),
+    accountSelectionMode: settingsForm.accountSelectionMode,
+    accountCooldownSeconds: Number(settingsForm.accountCooldownSeconds),
+    requestRetryLimit: Number(settingsForm.requestRetryLimit)
   });
   await refresh();
 }
@@ -822,6 +828,21 @@ onBeforeUnmount(() => {
           <label>
             <span>失败重试次数</span>
             <input v-model.number="settingsForm.retryCount" type="number" min="0" />
+          </label>
+          <label>
+            <span>选号模式（粘性=优先复用健康账号；轮换=均衡分发）</span>
+            <select v-model="settingsForm.accountSelectionMode">
+              <option value="sticky">粘性优先（推荐）</option>
+              <option value="lru">均衡轮换</option>
+            </select>
+          </label>
+          <label>
+            <span>失败账号冷却秒数（退避）</span>
+            <input v-model.number="settingsForm.accountCooldownSeconds" type="number" min="0" />
+          </label>
+          <label>
+            <span>失败自动换号重试上限（0=关闭）</span>
+            <input v-model.number="settingsForm.requestRetryLimit" type="number" min="0" />
           </label>
         </div>
 

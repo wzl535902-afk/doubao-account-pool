@@ -76,6 +76,12 @@ export interface AppSettings {
   generationTimeoutSeconds: number;
   maxConcurrentAccounts: number;
   retryCount: number;
+  /** 选号模式：sticky=粘性优先（成功账号连续复用）；lru=均衡轮换（最久未用优先）。 */
+  accountSelectionMode: "sticky" | "lru";
+  /** 失败账号冷却退避秒数（0=关闭）。 */
+  accountCooldownSeconds: number;
+  /** 单次请求失败后自动换号重试上限（0=不换号）。 */
+  requestRetryLimit: number;
   autoRemoveWatermark: boolean;
   watermarkApiUrl: string;
   watermarkApiToken: string;
@@ -92,6 +98,8 @@ export interface ApiRequest {
   accountId: number | null;
   accountName: string | null;
   accountPartition: string | null;
+  /** 已换号重试次数（池宪法④）。 */
+  retryCount?: number;
   status: ApiRequestStatus;
   message: string;
   prompt: string;
