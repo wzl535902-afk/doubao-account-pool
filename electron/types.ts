@@ -40,6 +40,8 @@ export interface Account {
   quotaRemaining: number;
   quotaUsedToday: number;
   lastUsedAt: string | null;
+  /** 冷却退避截止时间（池宪法④；null=未冷却）。 */
+  cooldownUntil?: string | null;
   createdAt: string;
   updatedAt: string;
 }

@@ -140,6 +140,7 @@ export class AppDatabase {
         quota_remaining AS quotaRemaining,
         quota_used_today AS quotaUsedToday,
         last_used_at AS lastUsedAt,
+        cooldown_until AS cooldownUntil,
         created_at AS createdAt,
         updated_at AS updatedAt
       FROM accounts
@@ -160,6 +161,7 @@ export class AppDatabase {
         quota_remaining AS quotaRemaining,
         quota_used_today AS quotaUsedToday,
         last_used_at AS lastUsedAt,
+        cooldown_until AS cooldownUntil,
         created_at AS createdAt,
         updated_at AS updatedAt
       FROM accounts
@@ -290,6 +292,7 @@ export class AppDatabase {
         quota_remaining AS quotaRemaining,
         quota_used_today AS quotaUsedToday,
         last_used_at AS lastUsedAt,
+        cooldown_until AS cooldownUntil,
         created_at AS createdAt,
         updated_at AS updatedAt
       FROM accounts
