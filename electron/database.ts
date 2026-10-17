@@ -783,6 +783,31 @@ export class AppDatabase {
     `).all(limit).map(normalizeApiRequest);
   }
 
+  /** 其他请求已认领的豆包会话地址（结果防误认：扫描最近对话时排除）。 */
+  listClaimedThreadUrls(excludeRequestId: string): string[] {
+    return (this.db.prepare(`
+      SELECT DISTINCT doubao_thread_url AS url
+      FROM api_requests
+      WHERE request_id != ? AND doubao_thread_url IS NOT NULL AND doubao_thread_url != ''
+    `).all(excludeRequestId) as Array<{ url: string }>).map((row) => row.url);
+  }
+
+  /** 其他请求已交付的视频地址（结果防误认：交付前校验对象键不重复）。 */
+  listDeliveredVideoResults(excludeRequestId: string): Array<{ requestId: string; createdAt: string; urls: string[] }> {
+    return (this.db.prepare(`
+      SELECT request_id AS requestId, created_at AS createdAt, clean_video_url AS cleanVideoUrl, raw_video_url AS rawVideoUrl
+      FROM api_requests
+      WHERE request_id != ? AND (clean_video_url IS NOT NULL OR raw_video_url IS NOT NULL)
+      ORDER BY id ASC
+    `).all(excludeRequestId) as Array<{ requestId: string; createdAt: string; cleanVideoUrl: string | null; rawVideoUrl: string | null }>).map(
+      (row) => ({
+        requestId: row.requestId,
+        createdAt: row.createdAt,
+        urls: [row.cleanVideoUrl, row.rawVideoUrl].filter((url): url is string => Boolean(url))
+      })
+    );
+  }
+
   queryApiRequests(query: ApiRequestQuery = {}): ApiRequest[] {
     const where: string[] = [];
     const params: unknown[] = [];

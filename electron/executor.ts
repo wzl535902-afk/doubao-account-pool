@@ -44,6 +44,14 @@ import { applyVideoDuration, videoDurationProbeScript, videoDurationChooseScript
 import type { Account, ApiRequest, ApiRequestStatus, AppSettings, DoubaoImageModel, DoubaoModel } from "./types.js";
 import { IMAGE_PAGE_MODEL_NAMES, isImageModel } from "./types.js";
 import { resolveCleanVideoUrl, verifyDoubaoShareVideoResource } from "./watermark.js";
+import {
+  findResultCollision,
+  isExcludedConversation,
+  planHistoryFallback,
+  ResultCollisionError,
+  resultCollisionMessage,
+  type HistoryFallbackPlan
+} from "./result-guard.js";
 
 type DataChangedCallback = () => void;
 type QueueItem = {
@@ -292,6 +300,7 @@ export class DoubaoExecutor {
       const recoveredThreadUrl = recovery.conversationUrl || threadUrl || request.doubaoThreadUrl;
       if (recovery.cleanVideoUrl) {
         // 页面数据直接解析到无水印原片（与正常生成同一路径），无需分享链接。
+        this.assertResultUnique(requestId, recovery.cleanVideoUrl);
         this.recordOperation(
           requestId,
           "解析无水印原片",
@@ -336,6 +345,7 @@ export class DoubaoExecutor {
       const shareUrl = resolvedVideo.shareUrl;
       const cleanVideo = resolvedVideo.cleanVideo;
       const cleanVideoUrl = cleanVideo.url;
+      this.assertResultUnique(requestId, cleanVideoUrl);
       const outputVideoPath = await downloadCleanVideoIfNeeded(settings, requestId, cleanVideoUrl);
       await this.updateProgress({
         requestId,
@@ -361,7 +371,7 @@ export class DoubaoExecutor {
         request,
         `恢复结果失败：${message}`,
         false,
-        errorInfo(innerCode).category === "A" ? innerCode : "RECOVER_NOT_FOUND"
+        errorInfo(innerCode).category === "A" || innerCode === "RESULT_COLLISION" ? innerCode : "RECOVER_NOT_FOUND"
       );
       this.database.updateAccount({
         id: account.id,
@@ -552,7 +562,8 @@ export class DoubaoExecutor {
         submittedConversationUrl,
         async (message) => {
         await this.updateProgress({ requestId, status: "running", message });
-        }
+        },
+        () => this.database.listClaimedThreadUrls(requestId)
       );
 
       if (!request.removeWatermark) {
@@ -561,6 +572,7 @@ export class DoubaoExecutor {
         if (!rawVideoUrl) {
           throw new Error("视频已生成，但未捕获到视频直链，无法下载原始视频");
         }
+        this.assertResultUnique(requestId, rawVideoUrl);
         const rawOutputVideoPath = await downloadRawVideoIfNeeded(settings, requestId, rawVideoUrl);
         await this.updateProgress({
           requestId,
@@ -588,6 +600,7 @@ export class DoubaoExecutor {
       }
 
       const unwatermarkedUrl = generationResult.cleanVideoUrl;
+      this.assertResultUnique(requestId, unwatermarkedUrl);
       this.recordOperation(
         requestId,
         "解析无水印原片",
@@ -814,6 +827,14 @@ export class DoubaoExecutor {
     this.onDataChanged();
     postCallback(updated);
     return updated;
+  }
+
+  /** 结果防误认：交付前确认该视频没有交付给过其他请求，撞了就拒收（已提交，不退额度，可找回）。 */
+  private assertResultUnique(requestId: string, url: string | null | undefined) {
+    const collision = findResultCollision(url, this.database.listDeliveredVideoResults(requestId));
+    if (!collision) return;
+    this.recordOperation(requestId, "结果校验", "failed", resultCollisionMessage(collision), url ?? undefined);
+    throw new ResultCollisionError(collision);
   }
 
   private recordOperation(
@@ -2153,7 +2174,8 @@ async function waitForGenerationResult(
   baselineVideoCardCount: number,
   prompt: string,
   preferredConversationUrl: string | null,
-  onProgress: (message: string) => Promise<void> | void
+  onProgress: (message: string) => Promise<void> | void,
+  claimedThreadUrls: () => string[] = () => []
 ): Promise<GenerationResult> {
   const timeoutMs = Math.max(60, timeoutSeconds || 900) * 1000;
   const historyFallbackMs = Math.max(30000, Math.min(360000, Math.floor(timeoutMs * 0.6)));
@@ -2247,13 +2269,19 @@ async function waitForGenerationResult(
       historyFallbackAttempted = true;
       await onProgress("当前执行窗口未同步完成状态，正在检查该账号最近对话");
       const originalUrl = win.webContents.getURL();
-      const currentConversationUrl = extractDoubaoConversationUrl(win.webContents.getURL());
-      const recovery = await findGeneratedConversationAndCopyShare(
+      const recovery = await runHistoryFallback(
         win,
         prompt,
-        currentConversationUrl || preferredConversationUrl
+        planHistoryFallback({
+          ownThreadUrl: preferredConversationUrl,
+          currentUrl: originalUrl,
+          prompt,
+          claimedThreadUrls: claimedThreadUrls()
+        }),
+        onProgress
       );
-      if (recovery.cleanVideoUrl) {
+      // recovery 为 null：兜底被跳过（无会话地址且提示词过短），继续在当前窗口等待。
+      if (recovery?.cleanVideoUrl) {
         return {
           shareUrl: recovery.shareUrl,
           directVideoUrl: directVideoUrl || recovery.directVideoUrl || null,
@@ -2261,13 +2289,13 @@ async function waitForGenerationResult(
           nomarkInfo: recovery.nomarkInfo
         };
       }
-      if (recovery.shareUrl) {
+      if (recovery?.shareUrl) {
         return { shareUrl: recovery.shareUrl, directVideoUrl: directVideoUrl || recovery.directVideoUrl || null };
       }
-      if (recovery.generatedMatchCount > 0) {
+      if (recovery && recovery.generatedMatchCount > 0) {
         return { shareUrl: null, directVideoUrl: directVideoUrl || recovery.directVideoUrl || null, shareFailureReason: recovery.shareFailureReason };
       }
-      if (originalUrl) {
+      if (recovery && originalUrl) {
         await loadUrl(win, originalUrl);
         await wait(1500);
         await dismissDoubaoDesktopDownloadPrompt(win);
@@ -2288,11 +2316,16 @@ async function waitForGenerationResult(
     return { shareUrl: null, directVideoUrl, shareFailureReason };
   }
   await onProgress("当前执行窗口等待超时，正在最后检查该账号最近对话");
-  const recovery = await findGeneratedConversationAndCopyShare(
-    win,
+  const finalPlan = planHistoryFallback({
+    ownThreadUrl: preferredConversationUrl,
+    currentUrl: win.webContents.getURL(),
     prompt,
-    extractDoubaoConversationUrl(win.webContents.getURL()) || preferredConversationUrl
-  );
+    claimedThreadUrls: claimedThreadUrls()
+  });
+  const recovery = await runHistoryFallback(win, prompt, finalPlan, onProgress);
+  if (!recovery) {
+    throw new Error(`等待豆包视频生成超时；${finalPlan.mode === "skip" ? finalPlan.reason : "未找到已生成视频"}`);
+  }
   if (recovery.cleanVideoUrl) {
     return {
       shareUrl: recovery.shareUrl,
@@ -2310,6 +2343,25 @@ async function waitForGenerationResult(
   throw new Error(
     `等待豆包视频生成超时；历史链接 ${recovery.candidateCount} 条，提示词匹配 ${recovery.promptMatchCount} 条，未找到已生成视频`
   );
+}
+
+/** 按规划执行“检查最近对话”兜底；skip 时只记录原因并返回 null。 */
+async function runHistoryFallback(
+  win: BrowserWindow,
+  prompt: string,
+  plan: HistoryFallbackPlan,
+  onProgress: (message: string) => Promise<void> | void
+) {
+  if (plan.mode === "skip") {
+    await onProgress(plan.reason);
+    return null;
+  }
+  if (plan.mode === "strict") {
+    return findGeneratedConversationAndCopyShare(win, prompt, plan.conversationUrl, { strict: true });
+  }
+  return findGeneratedConversationAndCopyShare(win, prompt, plan.preferredUrl, {
+    excludeConversationUrls: plan.excludeConversationUrls
+  });
 }
 
 async function inspectGenerationPage(win: BrowserWindow, scrollToLatest = true) {
@@ -2376,7 +2428,7 @@ async function findGeneratedConversationAndCopyShare(
   win: BrowserWindow,
   prompt: string,
   preferredConversationUrl: string | null = null,
-  options: { strict?: boolean } = {}
+  options: { strict?: boolean; excludeConversationUrls?: readonly string[] } = {}
 ) {
   const normalizedPrompt = normalizeComparableText(prompt);
   const candidates = await runPageScript<string[]>(win, `
@@ -2419,12 +2471,15 @@ async function findGeneratedConversationAndCopyShare(
   `);
   const preferredUrl = extractDoubaoConversationUrl(preferredConversationUrl);
   // strict：只检查已记录的本次会话，不扫描其他历史对话（D10）。
+  // 非 strict 扫描时排除已被其他请求认领的会话（结果防误认，见 result-guard.ts）。
+  const excluded = options.excludeConversationUrls ?? [];
   const orderedCandidates = options.strict && preferredUrl
     ? [preferredUrl]
     : Array.from(new Set([
       preferredUrl,
       ...candidates
-    ].filter((value): value is string => Boolean(value))));
+    ].filter((value): value is string => Boolean(value))))
+      .filter((value) => !isExcludedConversation(value, excluded));
   const signatureLength = Math.min(42, normalizedPrompt.length);
   const signatureSpan = Math.max(0, normalizedPrompt.length - signatureLength);
   const signatures = Array.from(new Set([0, 0.25, 0.5, 0.75, 1]

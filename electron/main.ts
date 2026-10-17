@@ -30,6 +30,7 @@ import type {
 } from "./types.js";
 import { isImageModel, modelCost } from "./types.js";
 import { resolveCleanVideoUrl } from "./watermark.js";
+import { findEarlierResultCollision, resultCollisionMessage } from "./result-guard.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -534,8 +535,20 @@ class LocalApiServer {
           return;
         }
         if (apiRequest.status === "success") {
-          sendJson(response, 409, { error: "请求已成功，无需找回", code: "ALREADY_SUCCEEDED", request: requestView(apiRequest) });
-          return;
+          // 唯一例外：结果与更早的请求重复（误认了别人的视频），允许回到本次会话重新找回。
+          const collision = findEarlierResultCollision(apiRequest, this.database.listDeliveredVideoResults(requestId));
+          if (!collision) {
+            sendJson(response, 409, { error: "请求已成功，无需找回", code: "ALREADY_SUCCEEDED", request: requestView(apiRequest) });
+            return;
+          }
+          this.database.appendOperationLog({
+            requestId,
+            accountId: apiRequest.accountId,
+            action: "结果校验",
+            status: "failed",
+            message: resultCollisionMessage(collision),
+            targetUrl: apiRequest.cleanVideoUrl || apiRequest.rawVideoUrl || undefined
+          });
         }
         if (apiRequest.errorCode && !apiRequest.submittedAt && apiRequest.errorCode !== "RECOVER_NOT_FOUND") {
           sendJson(response, 409, { error: "该请求从未提交到豆包，没有可找回的结果；请重新提交", code: "NOTHING_TO_RECOVER", request: requestView(apiRequest) });

@@ -80,6 +80,7 @@ export const ERROR_CODES = {
   SHARE_PANEL: { category: "C", label: "未能复制分享链接" },
   DOWNLOAD_FAILED: { category: "C", label: "结果下载失败" },
   RECOVER_NOT_FOUND: { category: "C", label: "找回失败，未定位到已生成结果" },
+  RESULT_COLLISION: { category: "C", label: "结果与其他任务重复（疑似误认），已拒收，可找回" },
 
   INTERRUPTED_BEFORE_SUBMIT: { category: "D", label: "执行器中断（未提交，已退额度）" },
   INTERRUPTED_AFTER_SUBMIT: { category: "D", label: "执行器中断（已提交，可找回）" },
@@ -120,6 +121,7 @@ interface Rule {
 
 /** 顺序即优先级：越具体越靠前。 */
 const RULES: Rule[] = [
+  { pattern: /^结果校验失败：拿到的视频与其他任务的结果重复/, code: "RESULT_COLLISION" },
   { pattern: /^放弃|已放弃/, code: "ABANDONED" },
   { pattern: /^恢复结果失败|未找到可恢复/, code: "RECOVER_NOT_FOUND" },
   { pattern: /执行卡死|无进展/, code: (s) => (s ? "STALLED_AFTER_SUBMIT" : "STALLED_BEFORE_SUBMIT") },
