@@ -1,3 +1,4 @@
+export type MediaPageKind = "unknown" | "consumer" | "work";
 export type LoginStatus = "unknown" | "logged_in" | "logged_out";
 export type AccountRuntimeStatus = "idle" | "busy" | "error" | "login_required";
 export type DoubaoVideoModel = "seedance_2_0_mini" | "seedance_2_0_fast" | "seedance_2_0";
@@ -35,6 +36,8 @@ export interface Account {
   partition: string;
   remark: string;
   loginStatus: LoginStatus;
+  /** UI capability only; does not change authentication or quota. */
+  mediaPageKind?: MediaPageKind;
   currentStatus: AccountRuntimeStatus;
   dailyQuotaLimit: number;
   quotaRemaining: number;
@@ -54,6 +57,7 @@ export interface AccountUpdateInput {
   id: number;
   remark?: string;
   loginStatus?: LoginStatus;
+  mediaPageKind?: MediaPageKind;
   currentStatus?: AccountRuntimeStatus;
   dailyQuotaLimit?: number;
   quotaRemaining?: number;
@@ -116,6 +120,7 @@ export interface ApiRequest {
   aspectRatio: string | null;
   resolution: string | null;
   imageCount: number;
+  durationSeconds?: number | null;
   imageUrls: string[] | null;
   outputImagePaths: string[] | null;
   createdAt: string;
@@ -138,6 +143,7 @@ export interface ApiRequestCreateInput {
   aspectRatio?: string | null;
   resolution?: string | null;
   imageCount?: number;
+  durationSeconds?: number | null;
 }
 
 export interface ApiRequestUpdateInput {
@@ -184,6 +190,8 @@ export interface ApiServerStatus {
 }
 
 export interface GenerateRequestBody {
+  durationSeconds?: number | string | null;
+  duration?: number | string | null;
   model?: DoubaoModel;
   prompt: string;
   referenceImagePath?: string | null;

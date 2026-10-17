@@ -11,6 +11,7 @@ export function toPublicApiRequest(request: ApiRequest) {
     imageUrls: request.imageUrls,
     outputImagePaths: request.outputImagePaths,
     aspectRatio: request.aspectRatio,
+    durationSeconds: request.durationSeconds ?? null,
     resolution: request.resolution,
     createdAt: request.createdAt,
     updatedAt: request.updatedAt,

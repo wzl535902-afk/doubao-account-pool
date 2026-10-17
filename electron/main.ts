@@ -8,6 +8,8 @@ import log from "electron-log/main.js";
 import { AppDatabase } from "./database.js";
 import { DoubaoExecutor } from "./executor.js";
 import { toPublicApiRequest } from "./public-api.js";
+import { inspectMediaPageKind, WORK_MEDIA_UNSUPPORTED } from "./media-compatibility.js";
+import { normalizeVideoDuration } from "./video-duration.js";
 import type {
   AccountUpdateInput,
   ApiRequest,
@@ -324,6 +326,13 @@ class LocalApiServer {
           return;
         }
 
+        let durationSeconds: number | null = null;
+        try {
+          if (!isImageModel(model)) durationSeconds = normalizeVideoDuration(body.durationSeconds ?? body.duration);
+        } catch (error) {
+          sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid video duration" });
+          return;
+        }
         const referenceImagePaths = await prepareReferenceImages(body, requestId);
         const referenceImagePath = referenceImagePaths[0] || null;
         // api_requests.aspect_ratio 为 NOT NULL：缺省用 16:9 兜底，避免整单在入库阶段炸掉。
@@ -341,13 +350,16 @@ class LocalApiServer {
             source: body.source,
             model,
             status: "failed",
-            message: "没有可用账号，或该模型剩余额度不足",
+            message: this.database.listAccounts().some(a => a.loginStatus === "logged_in" && a.mediaPageKind === "work")
+              ? `${WORK_MEDIA_UNSUPPORTED}；其他普通豆包账号暂无可用额度或仍在忙碌`
+              : "没有可用账号，或该模型剩余额度不足",
             prompt,
             referenceImagePath,
             referenceImagePaths,
             aspectRatio,
             resolution,
             imageCount,
+            durationSeconds,
             removeWatermark: true,
             callbackUrl: body.callbackUrl
           });
@@ -379,6 +391,7 @@ class LocalApiServer {
           aspectRatio,
           resolution,
           imageCount,
+          durationSeconds,
           removeWatermark: body.removeWatermark ?? true,
           callbackUrl: body.callbackUrl
         });
@@ -645,9 +658,18 @@ async function detectLoginStatus(accountId: number) {
   const activeRequest = db.listApiRequests(1000).some((request) =>
     request.accountId === accountId && (request.status === "accepted" || request.status === "running")
   );
+  // Probe only an already-open account window. Login/readiness checks must not
+  // launch a browser or consume quota. A failed/unfinished probe is not a logout.
+  let mediaPageKind = loginStatus === "logged_out" ? "unknown" as const : account.mediaPageKind ?? "unknown";
+  const existingWindow = doubaoWindows.get(accountId);
+  if (loginStatus === "logged_in" && existingWindow && !existingWindow.isDestroyed()) {
+    const observed = await inspectMediaPageKind(existingWindow.webContents);
+    if (observed !== "unknown") mediaPageKind = observed;
+  }
   const updated = db.updateAccount({
     id: accountId,
     loginStatus,
+    mediaPageKind,
     currentStatus: cookies.length > 0
       ? activeRequest
         ? "busy"
@@ -886,6 +908,7 @@ async function parseMultipartGenerateRequest(buffer: Buffer, contentType: string
     aspectRatio: fields.aspectRatio || null,
     resolution: fields.resolution || null,
     count: fields.count ? Number(fields.count) : undefined,
+    durationSeconds: fields.durationSeconds ?? fields.duration,
     source: fields.source || "multipart-api"
   };
 }

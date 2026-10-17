@@ -25,6 +25,9 @@ import {
   type NomarkVideoInfo
 } from "./doubao-nomark.js";
 import { toPublicApiRequest } from "./public-api.js";
+import { loadUrl, withPageDeadline } from "./page-runtime.js";
+import { inspectMediaPageKind, mediaEntryClickScript, mediaControlOpenScript, mediaMenuOptionClickScript, requestedVideoModelSelected, WORK_MEDIA_UNSUPPORTED } from "./media-compatibility.js";
+import { applyVideoDuration, videoDurationProbeScript, videoDurationChooseScript, applyVideoAspectRatio } from "./video-duration.js";
 import type { Account, ApiRequest, ApiRequestStatus, AppSettings, DoubaoImageModel, DoubaoModel } from "./types.js";
 import { IMAGE_PAGE_MODEL_NAMES, isImageModel } from "./types.js";
 import { resolveCleanVideoUrl, verifyDoubaoShareVideoResource } from "./watermark.js";
@@ -249,6 +252,13 @@ export class DoubaoExecutor {
         throw new Error("豆包账号未登录，请到「账号管理」重新登录该账号后再试");
       }
 
+      const mediaPageKind = await inspectMediaPageKind(win.webContents);
+      if (mediaPageKind !== "unknown") this.database.updateAccount({ id: account.id, mediaPageKind });
+      if (mediaPageKind === "work") {
+        // Stop before references, draft text or send. A known-incompatible
+        // profile is excluded by future media selections, not logged out.
+        throw new DoubaoPageFailureError(WORK_MEDIA_UNSUPPORTED, true);
+      }
       if (isImageModel(request.model)) {
         await this.runImagePipeline(request, account, settings, win, () => {
           submittedToDoubao = true;
@@ -265,6 +275,44 @@ export class DoubaoExecutor {
         message: "正在切换豆包视频生成模式"
       });
       await activateVideoMode(win, request.model);
+      type VideoPoint = { duration: number; aspectRatio: string | null; x: number; y: number };
+      const readVideoParameters = () => runPageScript<VideoPoint | null>(win!, videoDurationProbeScript("control"));
+      const openVideoParameters = async () => {
+        const opened = await runPageScript<boolean>(win!, mediaControlOpenScript("视频参数"));
+        if (opened) { await wait(400); return true; }
+        const point = await readVideoParameters();
+        if (!point) return false;
+        await sendMouseClick(win!, point.x, point.y);
+        await wait(400);
+        return true;
+      };
+      if (request.durationSeconds != null) {
+        await this.updateProgress({ requestId, status: "running", message: `正在确认视频时长 ${request.durationSeconds} 秒` });
+        await applyVideoDuration(request.durationSeconds, {
+          read: async () => (await readVideoParameters())?.duration ?? null,
+          open: openVideoParameters,
+          choose: async duration => {
+            const chosen = await runPageScript<boolean>(win!, videoDurationChooseScript(duration));
+            await wait(400);
+            return chosen;
+          }
+        });
+      }
+      await applyVideoAspectRatio(request.aspectRatio, {
+        read: async () => (await readVideoParameters())?.aspectRatio ?? null,
+        open: openVideoParameters,
+        choose: async ratio => {
+          const chosen = await runPageScript<boolean>(win!, mediaMenuOptionClickScript(ratio));
+          await wait(400);
+          return chosen;
+        }
+      });
+      // Ratio updates must not reset the previously verified duration.
+      await applyVideoDuration(request.durationSeconds, {
+        read: async () => (await readVideoParameters())?.duration ?? null,
+        open: async () => false,
+        choose: async () => false
+      });
 
       const referenceImagePaths = request.referenceImagePaths?.length
         ? request.referenceImagePaths
@@ -301,8 +349,10 @@ export class DoubaoExecutor {
         message: "正在提交豆包生成"
       });
       const generationBaseline = await inspectGenerationPage(win);
-      await submitPromptAndWait(win, request.model, request.prompt);
+      // Once a send action is attempted, a lost renderer response is ambiguous.
+      // Do not refund/retry automatically merely because the acknowledgement was lost.
       submittedToDoubao = true;
+      await submitPromptAndWait(win, request.model, request.prompt);
       await confirmVideoGenerationIfNeeded(win);
       const submittedConversationUrl = await waitForSubmittedConversationUrl(win);
       if (submittedConversationUrl) {
@@ -462,18 +512,13 @@ export class DoubaoExecutor {
 
     const activation = await activateImageMode(win, request.model as DoubaoImageModel);
     if (!activation.modelApplied) {
-      this.recordOperation(
-        requestId,
-        "图像模型选择",
-        "info",
-        `未在页面找到「${activation.targetName}」，当前页面模型「${activation.currentModel || "默认"}」；页面可选：${activation.options.join(" / ") || "未枚举到"}`
-      );
+      throw new Error(`未确认选中「${activation.targetName}」，当前模型 ${activation.currentModel || "(未知)"}；已停止提交，不使用默认模型替代`);
     }
 
     await this.updateProgress({ requestId, status: "running", message: "正在设置出图比例" });
     const ratioApplied = await applyImageRatio(win, request.aspectRatio);
-    if (!ratioApplied && request.aspectRatio && !/auto|自动/i.test(request.aspectRatio)) {
-      this.recordOperation(requestId, "图像比例设置", "info", `未命中「${request.aspectRatio}」比例选项，使用页面默认比例`);
+    if (!ratioApplied) {
+      throw new Error(`无法确认豆包页面已选择 ${request.aspectRatio}；已停止提交，不使用默认比例替代`);
     }
 
     await installImageCaptureHook(win);
@@ -499,6 +544,8 @@ export class DoubaoExecutor {
         await fillPrompt(win, request.prompt);
       }
 
+      // Mark before clicking: an unacknowledged click may already consume upstream quota.
+      onSubmitted();
       const clicked = await clickImageSendButton(win);
       if (!clicked) {
         await sendKeyboard(win, "Enter", undefined, 150);
@@ -508,8 +555,6 @@ export class DoubaoExecutor {
       if (!started) {
         throw new Error("图片提交失败：发送后输入框未清空且未出现生成中状态");
       }
-      onSubmitted();
-
       if (!threadUrl) {
         threadUrl = await waitForSubmittedConversationUrl(win);
         if (threadUrl) {
@@ -556,12 +601,12 @@ export class DoubaoExecutor {
 
     const modelNote = collected.usedModel ? `，豆包实际模型：${collected.usedModel}` : "";
     const partialNote = collected.images.length < total ? `（请求 ${total} 张，实际 ${collected.images.length} 张）` : "";
-    const ratioNote = ratioApplied ? "" : "，比例未命中使用默认";
+
     const promptNote = collected.promptRaw ? `，落款=${collected.promptRaw.slice(0, 140)}` : "";
     await this.updateProgress({
       requestId,
       status: "success",
-      message: `图片生成完成，无水印原图 ${collected.images.length} 张${outputPaths.length ? "，已保存到本地" : ""}${modelNote}${ratioNote}${partialNote}${promptNote}`,
+      message: `图片生成完成，无水印原图 ${collected.images.length} 张${outputPaths.length ? "，已保存到本地" : ""}${modelNote}${partialNote}${promptNote}`,
       doubaoThreadUrl: threadUrl,
       imageUrls: collected.images.map((item) => item.url),
       outputImagePaths: outputPaths.length ? outputPaths : null
@@ -697,39 +742,6 @@ export class DoubaoExecutor {
     }
     return win;
   }
-}
-
-async function loadUrl(win: BrowserWindow, url: string, timeoutMs = 30000) {
-  await new Promise<void>((resolve, reject) => {
-    let settled = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const cleanup = () => {
-      win.webContents.removeListener("did-finish-load", onFinish);
-      win.webContents.removeListener("did-fail-load", onFail);
-      if (timer) clearTimeout(timer);
-    };
-    const finish = (callback: () => void) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      callback();
-    };
-    const onFinish = () => {
-      finish(resolve);
-    };
-    const onFail = (_event: Electron.Event, _code: number, description: string) => {
-      finish(() => reject(new Error(`豆包页面加载失败：${description}`)));
-    };
-    win.webContents.once("did-finish-load", onFinish);
-    win.webContents.once("did-fail-load", onFail);
-    timer = setTimeout(() => {
-      finish(() => reject(new Error(`豆包页面加载超时（${Math.ceil(timeoutMs / 1000)} 秒）`)));
-      if (!win.isDestroyed()) win.webContents.stop();
-    }, timeoutMs);
-    void win.loadURL(url).catch((error) => {
-      finish(() => reject(error instanceof Error ? error : new Error(String(error))));
-    });
-  });
 }
 
 /** 等待豆包 SPA 水合完成：页面文本+编辑器数量连续稳定后才算就绪（冷窗口兜底）。 */
@@ -1001,15 +1013,11 @@ async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
   const isStandard = model === "seedance_2_0";
   const target = isStandard ? "Seedance 2.0" : model === "seedance_2_0_mini" ? "Mini" : "Fast";
   const isVideoModeActive = async () =>
-    runPageScript<boolean>(win, `
-      (() => {
-        const text = document.body ? document.body.innerText : "";
-        return /Seedance/.test(text);
-      })()
-    `);
+    requestedVideoModelSelected(await readVideoModelChip(win), model as import("./types.js").DoubaoVideoModel);
   const diag = (msg: string) =>
     runPageScript<boolean>(win, `(() => { try { window.__vidDiag = window.__vidDiag || []; window.__vidDiag.push(${JSON.stringify(msg)}); } catch (e) {} return true; })()`);
   const clickByTextRealmouse = async (text: string, minX: number) => {
+    if (["更多技能", "视频生成"].includes(text) && await runPageScript<boolean>(win, mediaEntryClickScript(text))) return true;
     const point = await exactTextPoint(win, text, minX);
     if (!point) return false;
     await sendMouseClick(win, point.x, point.y);
@@ -1050,20 +1058,11 @@ async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
       })()
     `);
     await diag(`r${round}:模型chip找到=${m3}`);
-    const chip = await runPageScript<{ x: number; y: number } | null>(win, "(() => (window.__vidChip || null))()");
-    if (chip) {
-      await sendMouseClick(win, chip.x, chip.y);
-    }
+    const openedModel = await runPageScript<boolean>(win, mediaControlOpenScript("模型"));
     await wait(800);
-    if (isStandard) {
-      // 标准档菜单项 = 精确文案「Seedance 2.0」：包含匹配会误中 Fast/Mini 子串。
-      const m4 = await clickByTextRealmouse("Seedance 2.0", 280);
-      await diag(`r${round}:标准档=${m4}`);
-    } else {
-      // Mini/Fast 菜单项为「Seedance 2.0 Fast快速出片选择」等组合文案：无精确叶子节点，用包含匹配。
-      const m4 = await clickByKeywords(win, [target, model === "seedance_2_0_mini" ? "mini" : "fast"]);
-      await diag(`r${round}:档位${target}=${m4}`);
-    }
+    const modelLabel = isStandard ? "Seedance 2.0" : `Seedance 2.0 ${target}`;
+    const selectedModel = openedModel && await runPageScript<boolean>(win, mediaMenuOptionClickScript(modelLabel));
+    await diag(`r${round}:目标模型菜单选择=${selectedModel}`);
     if (isStandard) {
       // 订阅门槛检测：免费账号点标准档会弹「会员订阅」对话框（锁死页面），必须识别并明确报错。
       const chip = await readVideoModelChip(win);
@@ -1072,9 +1071,9 @@ async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
         if (gate.subscriptionBlocked) {
           throw new Error("豆包账号未开通会员订阅，无法使用「Seedance 2.0」标准档（网页弹出了订阅对话框）");
         }
-        await clickByKeywords(win, ["Seedance", "模型", "model"]);
+        await runPageScript<boolean>(win, mediaControlOpenScript("模型"));
         await wait(800);
-        await clickByTextRealmouse("Seedance 2.0", 280);
+        await runPageScript<boolean>(win, mediaMenuOptionClickScript("Seedance 2.0"));
         await wait(1000);
         const chip2 = await readVideoModelChip(win);
         if (!/Seedance 2\.0/.test(chip2) || /Mini|Fast/.test(chip2)) {
@@ -1091,6 +1090,7 @@ async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
     await wait(1500);
   }
   await diag("failed-all-rounds");
+  throw new Error(`未能选择请求的视频模型 ${isStandard ? "Seedance 2.0" : `Seedance 2.0 ${target}`}；当前模型=${await readVideoModelChip(win) || "无模型控件"}；未发送提示词`);
 }
 
 /** 找「文本完全等于」的可见元素中心坐标（可限制最小 x，排除左侧边栏）。 */
@@ -1128,21 +1128,9 @@ type ImageCaptureSummary = {
   sawFailure: boolean;
 };
 
-/** 点击「模型」「比例」等图像控制条按钮（真实鼠标事件，兼容隐藏窗口）。 */
+/** Open only known non-generating media controls, including pointer-driven Radix menus. */
 async function clickControlByLabel(win: BrowserWindow, label: string) {
-  const point = await runPageScript<{ x: number; y: number } | null>(win, `
-    (() => {
-      const label = ${JSON.stringify(label)};
-      const btn = Array.from(document.querySelectorAll("button")).find((item) => String(item.textContent || "").trim().indexOf(label) === 0);
-      if (!btn) return null;
-      const rect = btn.getBoundingClientRect();
-      if (rect.width < 10 || rect.height < 10) return null;
-      return { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) };
-    })()
-  `);
-  if (!point) return false;
-  await sendMouseClick(win, point.x, point.y);
-  return true;
+  return runPageScript<boolean>(win, mediaControlOpenScript(label));
 }
 
 /** 读取图像控制条按钮当前文案（如「模型 Seedream 5.0 Flash」「比例 16:9」）。 */
@@ -1162,12 +1150,11 @@ async function collectControlOptions(win: BrowserWindow): Promise<string[]> {
     (() => {
       const out = [];
       const seen = new Set();
-      for (const el of document.querySelectorAll("body *")) {
+      for (const el of document.querySelectorAll('[role="menu"][data-state="open"] button,[role="menu"][data-state="open"] [role="menuitem"],[role="menu"][data-state="open"] [role="option"]')) {
         const content = String(el.textContent || "").trim();
         if (!content || content.length > 60 || seen.has(content)) continue;
         const numericRatio = /^[0-9]{1,2}:[0-9]{1,2}/.test(content);
         if (content.indexOf("Seedream") !== 0 && content.indexOf("即梦") !== 0 && !numericRatio) continue;
-        if (el.closest("button")) continue;
         const rect = el.getBoundingClientRect();
         if (rect.width < 20 || rect.height < 12 || rect.height > 140) continue;
         const style = getComputedStyle(el);
@@ -1180,34 +1167,9 @@ async function collectControlOptions(win: BrowserWindow): Promise<string[]> {
   `);
 }
 
-/** 在展开的菜单里按文案点击选项（优先非按钮元素，避开工具条按钮自身）。 */
+/** Select only an option in the currently open media menu. */
 async function clickMenuItemByText(win: BrowserWindow, text: string) {
-  return runPageScript<boolean>(win, `
-    (() => {
-      const wanted = ${JSON.stringify(text)};
-      const visible = (el) => {
-        const rect = el.getBoundingClientRect();
-        const style = getComputedStyle(el);
-        return rect.width > 16 && rect.height > 10 && style.visibility !== "hidden" && style.display !== "none";
-      };
-      const nodes = Array.from(document.querySelectorAll("body *"));
-      const passes = [ (el) => !el.closest("button"), () => true ];
-      for (const accept of passes) {
-        for (const el of nodes) {
-          const content = String(el.textContent || "").trim();
-          if (!content || content.length > 90) continue;
-          if (content.indexOf(wanted) < 0) continue;
-          if (el.childElementCount > 8) continue;
-          if (!visible(el)) continue;
-          if (!accept(el)) continue;
-          el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
-          el.click();
-          return true;
-        }
-      }
-      return false;
-    })()
-  `);
+  return runPageScript<boolean>(win, mediaMenuOptionClickScript(text));
 }
 
 /** 切到豆包图像生成模式，并尽量选中目标 Seedream 模型。 */
@@ -1239,6 +1201,7 @@ async function activateImageMode(win: BrowserWindow, model: DoubaoImageModel) {
     `);
 
   const clickEntry = async (label: string) => {
+    if (await runPageScript<boolean>(win, mediaEntryClickScript(label))) return true;
     const point = await runPageScript<{ x: number; y: number } | null>(win, `
       (() => {
         const label = ${JSON.stringify(label)};
@@ -1308,7 +1271,7 @@ async function activateImageMode(win: BrowserWindow, model: DoubaoImageModel) {
   }
 
   const currentModel = await readControlText(win, "模型");
-  if (currentModel.indexOf(targetName) >= 0) {
+  if (currentModel.replace(/^模型\s*/, "").replace(/\s+/g, "") === targetName.replace(/\s+/g, "")) {
     return { modelApplied: true, targetName, currentModel, options: [] as string[] };
   }
 
@@ -1323,7 +1286,7 @@ async function activateImageMode(win: BrowserWindow, model: DoubaoImageModel) {
     await wait(800);
     if (clicked) {
       const after = await readControlText(win, "模型");
-      modelApplied = after.indexOf(targetName) >= 0;
+      modelApplied = after.replace(/^模型\s*/, "").replace(/\s+/g, "") === targetName.replace(/\s+/g, "");
     }
     if (!modelApplied) {
       await sendKeyboard(win, "Escape", undefined, 120);
@@ -1334,15 +1297,15 @@ async function activateImageMode(win: BrowserWindow, model: DoubaoImageModel) {
   return { modelApplied, targetName, currentModel: finalModel || currentModel, options };
 }
 
-/** 设置出图比例（找不到目标项时保持页面默认，返回 false）。 */
+/** Confirm the explicit image ratio. A false result stops submission. */
 async function applyImageRatio(win: BrowserWindow, aspectRatio: string | null) {
   const raw = String(aspectRatio || "").trim().replace("：", ":");
   if (!raw || /^(auto|自动|默认)$/i.test(raw)) return true;
   const candidates = ["21:9", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "1:1"];
-  const wanted = candidates.find((item) => raw.indexOf(item) >= 0);
+  const wanted = candidates.find((item) => raw === item);
   if (!wanted) return false;
   const current = await readControlText(win, "比例");
-  if (current.indexOf(wanted) >= 0) return true;
+  if (current.replace(/^比例\s*/, "").replace(/\s+/g, "") === wanted) return true;
   const opened = await clickControlByLabel(win, "比例");
   if (!opened) return false;
   await wait(1200);
@@ -1355,7 +1318,7 @@ async function applyImageRatio(win: BrowserWindow, aspectRatio: string | null) {
     return false;
   }
   const after = await readControlText(win, "比例");
-  return after.indexOf(wanted) >= 0;
+  return after.replace(/^比例\s*/, "").replace(/\s+/g, "") === wanted;
 }
 
 /** 安装 /chat/completion 抓包钩子（fetch + XHR），结果存入 window.__poolImgCap。 */
@@ -3407,7 +3370,11 @@ function postCallback(request: ApiRequest) {
 }
 
 async function runPageScript<T>(win: BrowserWindow, script: string) {
-  return win.webContents.executeJavaScript(script, true) as Promise<T>;
+  if (win.isDestroyed()) throw new Error("豆包执行窗口已关闭，停止本次执行");
+  return withPageDeadline<T>(
+    () => win.webContents.executeJavaScript(script, true) as Promise<T>,
+    () => { if (!win.isDestroyed()) win.destroy(); }
+  );
 }
 
 async function getPageText(win: BrowserWindow) {

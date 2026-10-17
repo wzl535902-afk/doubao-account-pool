@@ -135,6 +135,7 @@ export class AppDatabase {
         partition,
         remark,
         login_status AS loginStatus,
+        media_page_kind AS mediaPageKind,
         current_status AS currentStatus,
         daily_quota_limit AS dailyQuotaLimit,
         quota_remaining AS quotaRemaining,
@@ -156,6 +157,7 @@ export class AppDatabase {
         partition,
         remark,
         login_status AS loginStatus,
+        media_page_kind AS mediaPageKind,
         current_status AS currentStatus,
         daily_quota_limit AS dailyQuotaLimit,
         quota_remaining AS quotaRemaining,
@@ -210,6 +212,7 @@ export class AppDatabase {
     const updated = {
       remark: input.remark ?? existing.remark,
       loginStatus: input.loginStatus ?? existing.loginStatus,
+      mediaPageKind: input.mediaPageKind ?? (input.loginStatus === "logged_out" ? "unknown" : existing.mediaPageKind ?? "unknown"),
       currentStatus: input.currentStatus ?? existing.currentStatus,
       dailyQuotaLimit: input.dailyQuotaLimit ?? existing.dailyQuotaLimit,
       quotaRemaining: input.quotaRemaining ?? existing.quotaRemaining,
@@ -222,6 +225,7 @@ export class AppDatabase {
       SET
         remark = ?,
         login_status = ?,
+        media_page_kind = ?,
         current_status = ?,
         daily_quota_limit = ?,
         quota_remaining = ?,
@@ -231,6 +235,7 @@ export class AppDatabase {
     `).run(
       updated.remark.trim(),
       updated.loginStatus,
+      updated.mediaPageKind,
       updated.currentStatus,
       clampInt(updated.dailyQuotaLimit),
       clampInt(updated.quotaRemaining),
@@ -287,6 +292,7 @@ export class AppDatabase {
         partition,
         remark,
         login_status AS loginStatus,
+        media_page_kind AS mediaPageKind,
         current_status AS currentStatus,
         daily_quota_limit AS dailyQuotaLimit,
         quota_remaining AS quotaRemaining,
@@ -297,6 +303,7 @@ export class AppDatabase {
         updated_at AS updatedAt
       FROM accounts
       WHERE login_status = 'logged_in'
+        AND media_page_kind != 'work'
         AND current_status IN ('idle', 'error')
         AND quota_remaining >= ?
         AND (cooldown_until IS NULL OR cooldown_until <= ?)
@@ -458,6 +465,7 @@ export class AppDatabase {
         api_requests.clean_video_url AS cleanVideoUrl,
         api_requests.output_video_path AS outputVideoPath,
         api_requests.aspect_ratio AS aspectRatio,
+        api_requests.duration_seconds AS durationSeconds,
         api_requests.resolution AS resolution,
         api_requests.image_count AS imageCount,
         api_requests.image_urls AS imageUrls,
@@ -495,6 +503,7 @@ export class AppDatabase {
         api_requests.clean_video_url AS cleanVideoUrl,
         api_requests.output_video_path AS outputVideoPath,
         api_requests.aspect_ratio AS aspectRatio,
+        api_requests.duration_seconds AS durationSeconds,
         api_requests.resolution AS resolution,
         api_requests.image_count AS imageCount,
         api_requests.image_urls AS imageUrls,
@@ -527,11 +536,12 @@ export class AppDatabase {
         aspect_ratio,
         resolution,
         image_count,
+        duration_seconds,
         created_at,
         updated_at,
         finished_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.requestId,
       input.source || "local-api",
@@ -547,6 +557,7 @@ export class AppDatabase {
       input.aspectRatio || null,
       input.resolution || null,
       Math.min(4, Math.max(1, input.imageCount || 1)),
+      input.durationSeconds ?? null,
       timestamp,
       timestamp,
       input.status === "failed" || input.status === "success" || input.status === "stopped" ? timestamp : null
@@ -706,6 +717,7 @@ export class AppDatabase {
   }
 
   private ensureAccountColumns() {
+    this.addColumnIfMissing("accounts", "media_page_kind", "TEXT NOT NULL DEFAULT 'unknown'");
     this.addColumnIfMissing("accounts", "name", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("accounts", "remark", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("accounts", "current_status", "TEXT NOT NULL DEFAULT 'idle'");
@@ -743,6 +755,7 @@ export class AppDatabase {
     this.addColumnIfMissing("api_requests", "clean_video_url", "TEXT");
     this.addColumnIfMissing("api_requests", "output_video_path", "TEXT");
     this.addColumnIfMissing("api_requests", "aspect_ratio", "TEXT");
+    this.addColumnIfMissing("api_requests", "duration_seconds", "INTEGER");
     this.addColumnIfMissing("api_requests", "resolution", "TEXT");
     this.addColumnIfMissing("api_requests", "image_count", "INTEGER NOT NULL DEFAULT 1");
     this.addColumnIfMissing("api_requests", "image_urls", "TEXT");
