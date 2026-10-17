@@ -88,6 +88,7 @@ const runtimeLabels: Record<AccountRuntimeStatus, string> = {
 };
 
 const requestLabels: Record<ApiRequestStatus, string> = {
+  queued: "排队中",
   accepted: "等待中",
   running: "执行中",
   success: "成功",
@@ -902,6 +903,7 @@ onBeforeUnmount(() => {
           <span>状态</span>
           <select v-model="logStatusFilter">
             <option value="all">全部状态</option>
+            <option value="queued">排队中</option>
             <option value="accepted">等待中</option>
             <option value="running">执行中</option>
             <option value="success">成功</option>

@@ -373,6 +373,7 @@ textarea:focus {
 
 .runtime-busy,
 .request-running,
+.request-queued,
 .request-accepted {
   background: #fff8db;
   color: #8a5a00;

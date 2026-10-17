@@ -7,12 +7,21 @@ import { app, BrowserWindow, ipcMain, session } from "electron";
 import log from "electron-log/main.js";
 import { AppDatabase } from "./database.js";
 import { DoubaoExecutor } from "./executor.js";
-import { toPublicApiRequest } from "./public-api.js";
-import { inspectMediaPageKind, WORK_MEDIA_UNSUPPORTED } from "./media-compatibility.js";
+import { toPoolJobView } from "./public-api.js";
+import { inspectMediaPageKind } from "./media-compatibility.js";
+import { RequestSupervisor } from "./request-supervisor.js";
+import {
+  ERROR_CODES,
+  normalizeClientRequestId,
+  normalizeQueueTimeoutSeconds,
+  parseAccountIdList,
+  parseOptionalAccountId
+} from "./request-lifecycle.js";
 import { normalizeVideoDuration } from "./video-duration.js";
 import type {
   AccountUpdateInput,
   ApiRequest,
+  ApiRequestStatus,
   ApiServerStatus,
   AppSettings,
   AppSettingsUpdateInput,
@@ -46,6 +55,28 @@ if (embeddedMode) {
 let db: AppDatabase;
 let executor: DoubaoExecutor;
 let apiServer: LocalApiServer;
+let supervisor: RequestSupervisor;
+
+/** 执行器协议 v2 能力声明（31423 据此判断能否走 /v2/jobs 映射）。 */
+const POOL_PROTOCOL = {
+  name: "pool-v2",
+  version: 1,
+  features: ["idempotency", "queue", "phases", "error-codes", "heartbeat", "watchdog", "abandon", "recover-guard", "full-view", "list"]
+} as const;
+
+const REQUEST_STATUSES: ApiRequestStatus[] = ["queued", "accepted", "running", "success", "failed", "stopped"];
+
+function requestView(request: ApiRequest, extra: { logs?: boolean; idempotentReplay?: boolean } = {}) {
+  return toPoolJobView(request, {
+    tracked: executor?.isTracked(request.requestId) ?? false,
+    idempotentReplay: extra.idempotentReplay,
+    logs: extra.logs ? db.listOperationLogsForRequest(request.requestId) : undefined
+  });
+}
+
+function paramError(response: ServerResponse, message: string) {
+  sendJson(response, 400, { error: message, code: "PARAM_INVALID", category: ERROR_CODES.PARAM_INVALID.category });
+}
 
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
 
@@ -138,7 +169,8 @@ class LocalApiServer {
         sendJson(response, 200, {
           ok: true,
           service: "doubao-account-pool",
-          api: this.getStatus()
+          api: this.getStatus(),
+          protocol: POOL_PROTOCOL
         });
         return;
       }
@@ -314,15 +346,32 @@ class LocalApiServer {
       if (request.method === "POST" && requestUrl.pathname === "/api/generate") {
         const requestId = `doubao-${randomUUID().replaceAll("-", "").slice(0, 16)}`;
         const body = await readGenerateRequest(request, requestId);
+
+        // 执行器协议 v2：幂等键。重复提交只返回已有请求，绝不二次生成或扣额度（铁律 1）。
+        let clientRequestId: string | null;
+        try {
+          clientRequestId = normalizeClientRequestId(body.clientRequestId);
+        } catch (error) {
+          paramError(response, error instanceof Error ? error.message : "invalid clientRequestId");
+          return;
+        }
+        if (clientRequestId) {
+          const existing = this.database.getApiRequestByClientRequestId(clientRequestId);
+          if (existing) {
+            sendJson(response, 200, requestView(existing, { idempotentReplay: true }));
+            return;
+          }
+        }
+
         const prompt = body.prompt?.trim();
         if (!prompt) {
-          sendJson(response, 400, { error: "prompt is required" });
+          paramError(response, "prompt is required");
           return;
         }
 
         const model = normalizeModel(body.model || settings.defaultModel);
         if (!model) {
-          sendJson(response, 400, { error: "unsupported model" });
+          paramError(response, "unsupported model");
           return;
         }
 
@@ -330,61 +379,37 @@ class LocalApiServer {
         try {
           if (!isImageModel(model)) durationSeconds = normalizeVideoDuration(body.durationSeconds ?? body.duration);
         } catch (error) {
-          sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid video duration" });
+          paramError(response, error instanceof Error ? error.message : "invalid video duration");
           return;
         }
+        const preferredAccountId = parseOptionalAccountId(body.accountId);
+        if (Number.isNaN(preferredAccountId)) {
+          paramError(response, "accountId must be a positive integer");
+          return;
+        }
+        const excludeAccountIds = parseAccountIdList(body.excludeAccountIds);
+        const queueFlag = typeof body.queue === "string" ? parseOptionalBoolean(body.queue) : body.queue ?? undefined;
+        // 旧调用方（无 clientRequestId）保持原行为：无空闲账号立即失败；v2 调用方默认排队。
+        const allowQueue = queueFlag ?? Boolean(clientRequestId);
+        const queueTimeoutSeconds = normalizeQueueTimeoutSeconds(body.queueTimeoutSeconds);
+
         const referenceImagePaths = await prepareReferenceImages(body, requestId);
         const referenceImagePath = referenceImagePaths[0] || null;
         // api_requests.aspect_ratio 为 NOT NULL：缺省用 16:9 兜底，避免整单在入库阶段炸掉。
         const aspectRatio = typeof body.aspectRatio === "string" && body.aspectRatio.trim() ? body.aspectRatio.trim() : "16:9";
         const resolution = typeof body.resolution === "string" && body.resolution.trim() ? body.resolution.trim() : null;
         const imageCount = Math.min(4, Math.max(1, Number(body.count ?? body.n ?? 1) || 1));
-        const account = settings.executorEnabled
-          ? this.database.reserveAvailableAccount(model)
-          : this.database.findAvailableAccount(model);
-        const cost = modelCost(settings, model);
+        const parentRequestId = typeof body.parentRequestId === "string" && body.parentRequestId.trim()
+          ? body.parentRequestId.trim().slice(0, 128)
+          : null;
 
-        if (!account) {
-          const failed = this.database.createApiRequest({
-            requestId,
-            source: body.source,
-            model,
-            status: "failed",
-            message: this.database.listAccounts().some(a => a.loginStatus === "logged_in" && a.mediaPageKind === "work")
-              ? `${WORK_MEDIA_UNSUPPORTED}；其他普通豆包账号暂无可用额度或仍在忙碌`
-              : "没有可用账号，或该模型剩余额度不足",
-            prompt,
-            referenceImagePath,
-            referenceImagePaths,
-            aspectRatio,
-            resolution,
-            imageCount,
-            durationSeconds,
-            removeWatermark: true,
-            callbackUrl: body.callbackUrl
-          });
-          this.database.appendOperationLog({
-            requestId,
-            action: "分配账号",
-            status: "failed",
-            message: failed.message
-          });
-          notifyDataChanged();
-          void postCallback(failed);
-          sendJson(response, 409, toPublicApiRequest(failed));
-          return;
-        }
-
-        this.database.deductQuota(account.id, model);
-        const created = this.database.createApiRequest({
+        // 幂等检查、选号、预扣、入库在同一个事务内完成（参考图下载等 await 之后再次检查幂等键）。
+        const admitted = this.database.admitGenerateRequest({
           requestId,
+          clientRequestId,
+          parentRequestId,
           source: body.source,
           model,
-          accountId: account.id,
-          status: "accepted",
-          message: settings.executorEnabled
-            ? `已接收，已预扣 ${cost} 额度，已进入执行队列`
-            : `已接收，已预扣 ${cost} 额度，自动执行已关闭`,
           prompt,
           referenceImagePath,
           referenceImagePaths,
@@ -393,21 +418,97 @@ class LocalApiServer {
           imageCount,
           durationSeconds,
           removeWatermark: body.removeWatermark ?? true,
-          callbackUrl: body.callbackUrl
+          callbackUrl: body.callbackUrl,
+          executorEnabled: settings.executorEnabled,
+          allowQueue,
+          queueTimeoutSeconds,
+          selection: { accountId: preferredAccountId, excludeAccountIds }
         });
-        if (settings.executorEnabled) {
-          this.requestExecutor.enqueue(created.requestId);
+
+        if (admitted.outcome === "replay") {
+          sendJson(response, 200, requestView(admitted.request, { idempotentReplay: true }));
+          return;
         }
-        this.database.appendOperationLog({
-          requestId,
-          accountId: account.id,
-          action: "接收接口请求",
-          status: "success",
-          message: created.message
-        });
+
+        if (admitted.outcome === "accepted") {
+          if (settings.executorEnabled) {
+            this.requestExecutor.enqueue(admitted.request.requestId);
+          }
+          this.database.appendOperationLog({
+            requestId,
+            accountId: admitted.account.id,
+            action: "接收接口请求",
+            status: "success",
+            message: admitted.request.message
+          });
+        } else if (admitted.outcome === "queued") {
+          this.database.appendOperationLog({
+            requestId,
+            action: "排队等待账号",
+            status: "info",
+            message: admitted.request.message
+          });
+        } else {
+          this.database.appendOperationLog({
+            requestId,
+            action: "分配账号",
+            status: "failed",
+            message: admitted.request.message
+          });
+        }
         notifyDataChanged();
-        void postCallback(created);
-        sendJson(response, 202, toPublicApiRequest(created));
+        void postCallback(admitted.request);
+        sendJson(response, admitted.outcome === "rejected" ? 409 : 202, requestView(admitted.request));
+        return;
+      }
+
+      if (request.method === "GET" && requestUrl.pathname === "/api/requests") {
+        const statusParam = requestUrl.searchParams.get("status");
+        const statuses = statusParam
+          ? statusParam.split(",").map((item) => item.trim()).filter((item): item is ApiRequestStatus =>
+            (REQUEST_STATUSES as string[]).includes(item))
+          : undefined;
+        const since = requestUrl.searchParams.get("since");
+        if (since && Number.isNaN(Date.parse(since))) {
+          paramError(response, "since must be an ISO timestamp");
+          return;
+        }
+        const requests = this.database.queryApiRequests({
+          statuses,
+          since: since ? new Date(since).toISOString() : null,
+          source: requestUrl.searchParams.get("source"),
+          clientRequestIdPrefix: requestUrl.searchParams.get("clientRequestIdPrefix"),
+          limit: Number(requestUrl.searchParams.get("limit") || 100)
+        });
+        sendJson(response, 200, {
+          serverTime: new Date().toISOString(),
+          protocol: POOL_PROTOCOL,
+          requests: requests.map((item) => requestView(item))
+        });
+        return;
+      }
+
+      const abandonMatch = requestUrl.pathname.match(/^\/api\/requests\/([^/]+)\/abandon$/);
+      if (request.method === "POST" && abandonMatch) {
+        const requestId = decodeURIComponent(abandonMatch[1]);
+        const result = supervisor.abandon(requestId);
+        if (result.httpStatus === 404) {
+          sendJson(response, 404, { error: "request not found", code: "JOB_NOT_FOUND" });
+          return;
+        }
+        notifyDataChanged();
+        if (result.httpStatus === 409) {
+          sendJson(response, 409, {
+            error: "任务已提交到豆包，不能放弃；请等待结果或在失败后「找回结果」",
+            code: result.code,
+            request: requestView(result.request)
+          });
+          return;
+        }
+        sendJson(response, result.httpStatus, {
+          ...requestView(result.request),
+          alreadyFinished: result.httpStatus === 200 ? result.alreadyFinished : false
+        });
         return;
       }
 
@@ -419,8 +520,29 @@ class LocalApiServer {
           sendJson(response, 404, { error: "request not found" });
           return;
         }
+        if (isImageModel(apiRequest.model)) {
+          sendJson(response, 409, { error: "图片请求不支持找回结果，请重新提交", code: "RECOVER_UNSUPPORTED" });
+          return;
+        }
+        if (
+          apiRequest.status === "queued" ||
+          apiRequest.status === "accepted" ||
+          apiRequest.status === "running" ||
+          this.requestExecutor.isTracked(requestId)
+        ) {
+          sendJson(response, 409, { error: "请求仍在进行中，不能同时找回", code: "JOB_ACTIVE", request: requestView(apiRequest) });
+          return;
+        }
+        if (apiRequest.status === "success") {
+          sendJson(response, 409, { error: "请求已成功，无需找回", code: "ALREADY_SUCCEEDED", request: requestView(apiRequest) });
+          return;
+        }
+        if (apiRequest.errorCode && !apiRequest.submittedAt && apiRequest.errorCode !== "RECOVER_NOT_FOUND") {
+          sendJson(response, 409, { error: "该请求从未提交到豆包，没有可找回的结果；请重新提交", code: "NOTHING_TO_RECOVER", request: requestView(apiRequest) });
+          return;
+        }
         if (!apiRequest.accountId) {
-          sendJson(response, 409, { error: "request has no assigned account" });
+          sendJson(response, 409, { error: "request has no assigned account", code: "NOTHING_TO_RECOVER" });
           return;
         }
         this.requestExecutor.enqueueRecovery(requestId);
@@ -434,7 +556,8 @@ class LocalApiServer {
         sendJson(response, 202, {
           requestId,
           status: "accepted",
-          message: "已进入结果恢复队列，不会重新提交视频生成"
+          message: "已进入结果恢复队列，不会重新提交视频生成",
+          request: requestView(apiRequest)
         });
         return;
       }
@@ -443,10 +566,10 @@ class LocalApiServer {
         const requestId = decodeURIComponent(requestUrl.pathname.replace("/api/requests/", ""));
         const apiRequest = this.database.getApiRequest(requestId);
         if (!apiRequest) {
-          sendJson(response, 404, { error: "request not found" });
+          sendJson(response, 404, { error: "request not found", code: "JOB_NOT_FOUND" });
           return;
         }
-        sendJson(response, 200, toPublicApiRequest(apiRequest));
+        sendJson(response, 200, requestView(apiRequest, { logs: requestUrl.searchParams.get("view") === "full" }));
         return;
       }
 
@@ -909,7 +1032,13 @@ async function parseMultipartGenerateRequest(buffer: Buffer, contentType: string
     resolution: fields.resolution || null,
     count: fields.count ? Number(fields.count) : undefined,
     durationSeconds: fields.durationSeconds ?? fields.duration,
-    source: fields.source || "multipart-api"
+    source: fields.source || "multipart-api",
+    clientRequestId: fields.clientRequestId || null,
+    parentRequestId: fields.parentRequestId || null,
+    accountId: fields.accountId || null,
+    excludeAccountIds: fields.excludeAccountIds || null,
+    queue: fields.queue ?? null,
+    queueTimeoutSeconds: fields.queueTimeoutSeconds ?? null
   };
 }
 
@@ -1032,7 +1161,8 @@ async function postCallback(payload: ApiRequest) {
   await fetch(payload.callbackUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(toPublicApiRequest(payload))
+    body: JSON.stringify(requestView(payload)),
+    signal: AbortSignal.timeout(5000)
   }).catch(() => undefined);
 }
 
@@ -1051,7 +1181,21 @@ if (!hasSingleInstanceLock) {
   app.whenReady().then(async () => {
     log.initialize();
     db = new AppDatabase();
-    executor = new DoubaoExecutor(db, notifyDataChanged);
+    executor = new DoubaoExecutor(db, notifyDataChanged, {
+      onRunSettled: () => supervisor?.dispatchQueued()
+    });
+    supervisor = new RequestSupervisor({
+      database: db,
+      executor,
+      onRequestChanged: (changed) => {
+        notifyDataChanged();
+        void postCallback(changed);
+      }
+    });
+    // 启动清扫：上次进程留下的 accepted/running 都是孤儿（内存队列已丢失）。
+    const swept = supervisor.sweepOrphans("restart");
+    if (swept.length) log.warn(`启动清扫：收尾 ${swept.length} 个中断请求`, swept.map((item) => `${item.requestId}:${item.errorCode}`));
+    supervisor.start();
     apiServer = new LocalApiServer(db, executor);
     registerIpc();
     await apiServer.applySettings(db.getSettings());
@@ -1072,6 +1216,7 @@ if (!hasSingleInstanceLock) {
 }
 
 app.on("before-quit", async () => {
+  supervisor?.stop();
   await apiServer?.stop();
 });
 

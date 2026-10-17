@@ -24,7 +24,20 @@ import {
   resolveUnwatermarkedVideo,
   type NomarkVideoInfo
 } from "./doubao-nomark.js";
-import { toPublicApiRequest } from "./public-api.js";
+import { toPoolJobView } from "./public-api.js";
+import { RunAbortedError, RunRegistry, type AbortReason, type RunContext } from "./run-watchdog.js";
+import {
+  ABORT_GRACE_MS,
+  HEARTBEAT_INTERVAL_MS,
+  MIN_PROMPT_LENGTH_FOR_FUZZY_RECOVERY,
+  classifyFailure,
+  errorInfo,
+  hardDeadlineMs,
+  phaseForProgress,
+  resolveOrphan,
+  stallLimitMs,
+  type ErrorCode
+} from "./request-lifecycle.js";
 import { loadUrl, withPageDeadline } from "./page-runtime.js";
 import { inspectMediaPageKind, mediaEntryClickScript, mediaControlOpenScript, mediaMenuOptionClickScript, requestedVideoModelSelected, WORK_MEDIA_UNSUPPORTED } from "./media-compatibility.js";
 import { applyVideoDuration, videoDurationProbeScript, videoDurationChooseScript, applyVideoAspectRatio } from "./video-duration.js";
@@ -91,24 +104,113 @@ const CALLBACK_TIMEOUT_MS = 5000;
 const VIDEO_CARD_WAIT_MS = 25000;
 const callbackQueues = new Map<string, Promise<void>>();
 
+export interface ExecutorHooks {
+  /** 每次执行（含被看门狗终止）结束、执行槽位释放后调用；用于派发排队请求。 */
+  onRunSettled?: () => void;
+}
+
+export type AbandonOutcome = "aborting" | "dequeued" | "submitted" | "not_active";
+
 export class DoubaoExecutor {
   private readonly scheduler: AccountTaskScheduler<QueueItem>;
+  /** 执行看门狗：心跳、卡死检测、强制终止（D9）。 */
+  readonly runs: RunRegistry;
 
   constructor(
     private readonly database: AppDatabase,
-    private readonly onDataChanged: DataChangedCallback
+    private readonly onDataChanged: DataChangedCallback,
+    private readonly hooks: ExecutorHooks = {}
   ) {
+    this.runs = new RunRegistry({
+      heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
+      abortGraceMs: ABORT_GRACE_MS,
+      stallLimitMs: (ctx) => stallLimitMs({ submitted: ctx.submitted, mode: ctx.mode }),
+      hardDeadlineMs: (ctx) => hardDeadlineMs({
+        mode: ctx.mode,
+        generationTimeoutSeconds: this.database.getSettings().generationTimeoutSeconds
+      }),
+      onHeartbeat: (ctx) => this.database.touchApiRequestHeartbeat(ctx.requestId),
+      onAbort: (ctx, reason) => this.finalizeAbortedRun(ctx, reason)
+    });
     this.scheduler = new AccountTaskScheduler(
       () => this.database.getSettings().maxConcurrentAccounts,
       async (item) => {
-        if (item.mode === "recover") {
-          await this.recoverResult(item.requestId);
-        } else {
-          await this.execute(item.requestId);
+        try {
+          await this.runs.run(item.requestId, item.mode, () =>
+            item.mode === "recover" ? this.recoverResult(item.requestId) : this.execute(item.requestId)
+          );
+        } finally {
+          // 在调度器释放该账号槽位之后再通知，便于立刻派发排队请求。
+          setImmediate(() => this.hooks.onRunSettled?.());
         }
       },
       (error) => console.error("豆包并行执行器异常", error)
     );
+  }
+
+  /** 请求是否在执行器内存中（排队、执行或等待重试）。 */
+  isTracked(requestId: string) {
+    return this.scheduler.has(requestId) || this.runs.isActive(requestId);
+  }
+
+  isRunning(requestId: string) {
+    return this.runs.isActive(requestId);
+  }
+
+  /**
+   * 放弃一个请求：未开始的从队列移除（调用方负责收尾退款），执行中且未提交的强制终止
+   * （看门狗统一收尾并退款），已提交的拒绝（铁律 3：已提交只能等待或找回）。
+   */
+  abandon(requestId: string): AbandonOutcome {
+    const ctx = this.runs.get(requestId);
+    if (ctx) {
+      const request = this.database.getApiRequest(requestId);
+      if (ctx.submitted || request?.submittedAt) return "submitted";
+      this.runs.abort(requestId, "abandoned");
+      return "aborting";
+    }
+    if (this.scheduler.remove(requestId)) return "dequeued";
+    return "not_active";
+  }
+
+  /** 看门狗终止后的唯一收尾入口：只在请求仍处于 accepted/running 时写入，避免覆盖已完成结果。 */
+  private finalizeAbortedRun(ctx: RunContext, reason: AbortReason) {
+    const request = this.database.getApiRequest(ctx.requestId);
+    if (!request) return;
+    const submitted = ctx.mode === "recover" || ctx.submitted || Boolean(request.submittedAt);
+    const resolution = resolveOrphan({
+      reason,
+      submitted,
+      doubaoThreadUrl: request.doubaoThreadUrl,
+      isImage: isImageModel(request.model)
+    });
+    const message = ctx.mode === "recover" ? `恢复结果失败：${resolution.message}` : resolution.message;
+    const finalized = this.database.finalizeApiRequest({
+      requestId: ctx.requestId,
+      expectStatuses: ["accepted", "running"],
+      message,
+      errorCode: ctx.mode === "recover" && reason !== "abandoned" ? "RECOVER_NOT_FOUND" : resolution.code,
+      workflowPhase: resolution.phase,
+      refund: ctx.mode !== "recover" && resolution.refund,
+      releaseAccount: true
+    });
+    if (!finalized) return;
+    this.database.appendOperationLog({
+      requestId: ctx.requestId,
+      accountId: finalized.accountId,
+      action: reason === "abandoned" ? "放弃任务" : "看门狗终止",
+      status: "failed",
+      message: finalized.message
+    });
+    this.onDataChanged();
+    postCallback(finalized);
+  }
+
+  /** 记录“已提交到豆包”。之后失败不自动退款/重生（铁律 3）。必须在点击发送之前调用。 */
+  private markSubmitted(requestId: string) {
+    this.runs.assertLive();
+    this.runs.markSubmitted();
+    this.database.markApiRequestSubmitted(requestId);
   }
 
   enqueue(requestId: string) {
@@ -133,6 +235,17 @@ export class DoubaoExecutor {
   private async recoverResult(requestId: string) {
     const request = this.database.getApiRequest(requestId);
     if (!request?.accountId) return;
+    if (isImageModel(request.model)) {
+      console.warn("图片请求不支持找回结果", requestId);
+      return;
+    }
+    if (request.status === "queued" || request.status === "accepted" || request.status === "running") {
+      console.warn("请求仍在进行中，跳过找回", requestId, request.status);
+      return;
+    }
+    // 找回只针对已提交的请求（API 已拒绝明确未提交的请求）。v2 之前的历史记录没有 submitted_at，
+    // 在此补记，保证找回失败后仍可再次找回、且不会被当作“未提交”退款。
+    if (!request.submittedAt) this.database.markApiRequestSubmitted(requestId);
 
     const account = this.database.getAccount(request.accountId);
     if (!account) return;
@@ -157,14 +270,55 @@ export class DoubaoExecutor {
         throw new Error("豆包账号未登录，无法恢复视频结果");
       }
 
+      // D10：有会话地址时只在该会话里找回，绝不按提示词去别的对话里“认领”视频；
+      // 没有会话地址时才按提示词匹配，且提示词过短时拒绝（极易误认其他任务的视频）。
+      const threadUrl = extractDoubaoConversationUrl(request.doubaoThreadUrl);
+      if (!threadUrl && normalizeComparableText(request.prompt).length < MIN_PROMPT_LENGTH_FOR_FUZZY_RECOVERY) {
+        throw new Error(
+          `未找到可恢复的豆包视频：没有记录本次豆包会话地址，且提示词过短（少于 ${MIN_PROMPT_LENGTH_FOR_FUZZY_RECOVERY} 字），无法安全定位，已停止以免误认其他任务的视频`
+        );
+      }
+      await this.updateProgress({
+        requestId,
+        status: "running",
+        message: threadUrl ? "正在打开本次豆包会话找回结果" : "未记录会话地址，正在按提示词定位豆包已生成视频"
+      });
       const recovery = await findGeneratedConversationAndCopyShare(
         win,
         request.prompt,
-        request.doubaoThreadUrl
+        threadUrl,
+        { strict: Boolean(threadUrl) }
       );
+      const recoveredThreadUrl = recovery.conversationUrl || threadUrl || request.doubaoThreadUrl;
+      if (recovery.cleanVideoUrl) {
+        // 页面数据直接解析到无水印原片（与正常生成同一路径），无需分享链接。
+        this.recordOperation(
+          requestId,
+          "解析无水印原片",
+          "success",
+          `找回：已从豆包获取无水印原画（${formatNomarkMeta(recovery.nomarkInfo)}）`,
+          recovery.cleanVideoUrl
+        );
+        const recoveredPath = await downloadCleanVideoIfNeeded(settings, requestId, recovery.cleanVideoUrl);
+        await this.updateProgress({
+          requestId,
+          status: "success",
+          message: recoveredPath
+            ? `已恢复结果，无水印原画已保存到本地（${formatNomarkMeta(recovery.nomarkInfo)}）`
+            : `已恢复结果，无水印原片地址已获取（${formatNomarkMeta(recovery.nomarkInfo)}）`,
+          doubaoThreadUrl: recoveredThreadUrl,
+          rawVideoUrl: null,
+          cleanVideoUrl: recovery.cleanVideoUrl,
+          outputVideoPath: recoveredPath,
+          errorCode: null
+        });
+        this.database.updateAccount({ id: account.id, currentStatus: "idle" });
+        this.database.clearAccountCooldown(account.id);
+        return;
+      }
       if (!recovery.shareUrl) {
         throw new Error(
-          `未找到可恢复的豆包视频：历史链接 ${recovery.candidateCount} 条，提示词匹配 ${recovery.promptMatchCount} 条，确认已生成 ${recovery.generatedMatchCount} 条，仍未复制到分享链接${recovery.shareFailureReason ? `（${recovery.shareFailureReason}）` : ""}`
+          `未找到可恢复的豆包视频：${threadUrl ? "已打开本次会话" : `历史链接 ${recovery.candidateCount} 条`}，提示词匹配 ${recovery.promptMatchCount} 条，确认已生成 ${recovery.generatedMatchCount} 条，仍未拿到无水印原片或分享链接${recovery.shareFailureReason ? `（${recovery.shareFailureReason}）` : ""}`
         );
       }
       this.recordOperation(
@@ -189,16 +343,26 @@ export class DoubaoExecutor {
         message: outputVideoPath
           ? `已恢复结果，去水印 MP4 已验证并保存到本地（${formatWatermarkResolution(cleanVideo)}）`
           : `已恢复结果，去水印 MP4 地址已验证（${formatWatermarkResolution(cleanVideo)}）`,
-        doubaoThreadUrl: shareUrl,
+        // 保留会话地址（找回/排障依赖它）；分享地址记录在操作日志里。
+        doubaoThreadUrl: recoveredThreadUrl || shareUrl,
         rawVideoUrl: null,
         cleanVideoUrl,
-        outputVideoPath
+        outputVideoPath,
+        errorCode: null
       });
       this.database.updateAccount({ id: account.id, currentStatus: "idle" });
       this.database.clearAccountCooldown(account.id);
     } catch (error) {
+      if (error instanceof RunAbortedError || this.runs.current()?.aborted) return;
       const message = errorMessage(error);
-      await this.failRequest(request, `恢复结果失败：${message}`, false);
+      // 账号类原因（未登录/验证码）保留原错误码，便于上层提示“先处理账号”；其余统一为找回失败。
+      const innerCode = classifyFailure(message, true);
+      await this.failRequest(
+        request,
+        `恢复结果失败：${message}`,
+        false,
+        errorInfo(innerCode).category === "A" ? innerCode : "RECOVER_NOT_FOUND"
+      );
       this.database.updateAccount({
         id: account.id,
         currentStatus: /未登录|登录/.test(message) ? "login_required" : "idle"
@@ -212,6 +376,11 @@ export class DoubaoExecutor {
   private async execute(requestId: string) {
     const request = this.database.getApiRequest(requestId);
     if (!request) return;
+    // 只执行 accepted 的请求：防止重复入队、放弃后残留或重启清扫后的请求被再次生成。
+    if (request.status !== "accepted") {
+      console.warn("跳过非 accepted 状态的请求", requestId, request.status);
+      return;
+    }
 
     if (!request.accountId) {
       await this.failRequest(request, "请求没有分配账号", false);
@@ -261,6 +430,7 @@ export class DoubaoExecutor {
       }
       if (isImageModel(request.model)) {
         await this.runImagePipeline(request, account, settings, win, () => {
+          this.markSubmitted(requestId);
           submittedToDoubao = true;
         });
         this.database.updateAccount({ id: account.id, currentStatus: "idle" });
@@ -351,6 +521,7 @@ export class DoubaoExecutor {
       const generationBaseline = await inspectGenerationPage(win);
       // Once a send action is attempted, a lost renderer response is ambiguous.
       // Do not refund/retry automatically merely because the acknowledgement was lost.
+      this.markSubmitted(requestId);
       submittedToDoubao = true;
       await submitPromptAndWait(win, request.model, request.prompt);
       await confirmVideoGenerationIfNeeded(win);
@@ -445,6 +616,8 @@ export class DoubaoExecutor {
         win.close();
       }
     } catch (error) {
+      // 被看门狗终止（卡死/放弃）：收尾由 finalizeAbortedRun 统一完成，这里不得再写状态或退款。
+      if (error instanceof RunAbortedError || this.runs.current()?.aborted) return;
       let failure = error;
       if (win && !win.isDestroyed() && !accountBlocked && (await withTimeout(isDoubaoCaptchaVisible(win).catch(() => false), 6000, false))) {
         // 验证码处置统一走「账号管理」：不亮窗、不保活；重登该账号后会话自动同步回号池
@@ -452,14 +625,19 @@ export class DoubaoExecutor {
         accountBlocked = true;
       }
       // 池宪法④：失败冷却退避 + 自动换号重试（仅可重试类失败，避免重复计费）。
+      // 严格指定账号（preferredAccountId）时不换号；换号时同样遵守 excludeAccountIds。
       if (
         !accountBlocked &&
         isRefundableExecutionError(failure) &&
+        request.preferredAccountId == null &&
         settings.requestRetryLimit > 0 &&
         (request.retryCount ?? 0) < settings.requestRetryLimit
       ) {
+        this.runs.assertLive();
         this.database.markAccountCooldown(account.id, settings.accountCooldownSeconds);
-        const nextAccount = this.database.reserveAvailableAccount(request.model);
+        const nextAccount = this.database.reserveAvailableAccount(request.model, {
+          excludeAccountIds: [...(request.excludeAccountIds ?? []), account.id]
+        });
         if (nextAccount && nextAccount.id !== account.id) {
           this.database.refundQuota(account.id, request.model);
           this.database.deductQuota(nextAccount.id, request.model);
@@ -480,11 +658,14 @@ export class DoubaoExecutor {
           if (win && !win.isDestroyed() && settings.autoCloseExecutorWindow) {
             win.close();
           }
-          this.scheduler.enqueue({ key: requestId, requestId, accountId: nextAccount.id, mode: "generate" });
+          // 当前 worker 仍持有该 key：enqueue 会被静默丢弃导致请求卡在 accepted，必须用 requeue。
+          this.scheduler.requeue({ key: requestId, requestId, accountId: nextAccount.id, mode: "generate" });
           return;
         }
       }
       const shouldRefundQuota = !submittedToDoubao || isRefundableExecutionError(failure);
+      // 退款与写失败状态之间没有 await，看门狗无法插入，避免双重退款。
+      this.runs.assertLive();
       if (shouldRefundQuota) {
         this.database.refundQuota(account.id, request.model);
       }
@@ -614,7 +795,14 @@ export class DoubaoExecutor {
   }
 
   private async updateProgress(input: Parameters<AppDatabase["updateApiRequest"]>[0]) {
-    const updated = this.database.updateApiRequest(input);
+    // 被看门狗终止后，原流程的任何进度写入都会在这里抛 RunAbortedError。
+    this.runs.touch();
+    const existing = this.database.getApiRequest(input.requestId);
+    const status = input.status ?? existing?.status ?? "running";
+    const workflowPhase = input.workflowPhase === undefined
+      ? phaseForProgress(input.message, status, existing?.workflowPhase)
+      : input.workflowPhase;
+    const updated = this.database.updateApiRequest({ ...input, workflowPhase });
     this.database.appendOperationLog({
       requestId: updated.requestId,
       accountId: updated.accountId,
@@ -704,12 +892,16 @@ export class DoubaoExecutor {
     }
   }
 
-  private async failRequest(request: ApiRequest, message: string, refunded: boolean) {
+  private async failRequest(request: ApiRequest, message: string, refunded: boolean, code?: ErrorCode) {
     const suffix = refunded ? "，已退回预扣额度" : "";
+    const current = this.database.getApiRequest(request.requestId);
+    const errorCode = code ?? classifyFailure(message, Boolean(current?.submittedAt));
     return this.updateProgress({
       requestId: request.requestId,
       status: "failed",
-      message: `${message}${suffix}`
+      message: `${message}${suffix}`,
+      errorCode,
+      quotaRefunded: refunded || Boolean(current?.quotaRefunded)
     });
   }
 
@@ -740,6 +932,8 @@ export class DoubaoExecutor {
       win.setOpacity(0);
       win.setIgnoreMouseEvents(true);
     }
+    // 交给看门狗：判定卡死/放弃时销毁该窗口，让挂起的页面调用尽快失败。
+    this.runs.registerWindow(win);
     return win;
   }
 }
@@ -2181,7 +2375,8 @@ async function inspectGenerationPage(win: BrowserWindow, scrollToLatest = true) 
 async function findGeneratedConversationAndCopyShare(
   win: BrowserWindow,
   prompt: string,
-  preferredConversationUrl: string | null = null
+  preferredConversationUrl: string | null = null,
+  options: { strict?: boolean } = {}
 ) {
   const normalizedPrompt = normalizeComparableText(prompt);
   const candidates = await runPageScript<string[]>(win, `
@@ -2223,10 +2418,13 @@ async function findGeneratedConversationAndCopyShare(
     })()
   `);
   const preferredUrl = extractDoubaoConversationUrl(preferredConversationUrl);
-  const orderedCandidates = Array.from(new Set([
-    preferredUrl,
-    ...candidates
-  ].filter((value): value is string => Boolean(value))));
+  // strict：只检查已记录的本次会话，不扫描其他历史对话（D10）。
+  const orderedCandidates = options.strict && preferredUrl
+    ? [preferredUrl]
+    : Array.from(new Set([
+      preferredUrl,
+      ...candidates
+    ].filter((value): value is string => Boolean(value))));
   const signatureLength = Math.min(42, normalizedPrompt.length);
   const signatureSpan = Math.max(0, normalizedPrompt.length - signatureLength);
   const signatures = Array.from(new Set([0, 0.25, 0.5, 0.75, 1]
@@ -2291,6 +2489,7 @@ async function findGeneratedConversationAndCopyShare(
     const recoveryNomark = await resolveNomarkCleanVideo(win).catch(() => null);
     if (recoveryNomark?.url) {
       return {
+        conversationUrl: candidate,
         shareUrl: null,
         directVideoUrl: recoveryDirectVideoUrl,
         cleanVideoUrl: recoveryNomark.url,
@@ -2307,6 +2506,7 @@ async function findGeneratedConversationAndCopyShare(
       shareFailureReason = copied.reason;
       if (copied.shareUrl) {
         return {
+          conversationUrl: candidate,
           shareUrl: copied.shareUrl,
           directVideoUrl: recoveryDirectVideoUrl,
           cleanVideoUrl: null,
@@ -2322,6 +2522,7 @@ async function findGeneratedConversationAndCopyShare(
   }
 
   return {
+    conversationUrl: null as string | null,
     shareUrl: null,
     directVideoUrl: recoveryDirectVideoUrl,
     cleanVideoUrl: null,
@@ -3359,7 +3560,7 @@ function postCallback(request: ApiRequest) {
       await fetch(request.callbackUrl!, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(toPublicApiRequest(request)),
+        body: JSON.stringify(toPoolJobView(request)),
         signal: AbortSignal.timeout(CALLBACK_TIMEOUT_MS)
       }).catch(() => undefined);
     });

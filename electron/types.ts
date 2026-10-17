@@ -27,7 +27,11 @@ export function modelCost(
   if (model === "seedance_2_0") return settings.standardCost;
   return settings.fastCost;
 }
-export type ApiRequestStatus = "accepted" | "running" | "success" | "failed" | "stopped";
+/**
+ * queued: 已受理但暂无空闲账号，未选号、未扣额度，等待调度器派发（执行器协议 v2）。
+ * accepted: 已选号并预扣额度，等待执行槽位。
+ */
+export type ApiRequestStatus = "queued" | "accepted" | "running" | "success" | "failed" | "stopped";
 export type OperationLogStatus = "info" | "success" | "failed";
 
 export interface Account {
@@ -126,6 +130,26 @@ export interface ApiRequest {
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;
+  /** 执行器协议 v2：调用方幂等键（如 `<goTaskId>#<attemptNo>`），全局唯一。 */
+  clientRequestId?: string | null;
+  /** 执行器协议 v2：由哪个请求重提而来（审计链）。 */
+  parentRequestId?: string | null;
+  /** 细粒度阶段，见 request-lifecycle.ts WorkflowPhase。 */
+  workflowPhase?: string | null;
+  /** 已把提示词提交给豆包的时间；非空即“已提交”，之后绝不自动重新生成。 */
+  submittedAt?: string | null;
+  /** 执行中的心跳时间（每 15 秒），用于识别僵尸任务。 */
+  heartbeatAt?: string | null;
+  /** 稳定错误码，见 request-lifecycle.ts ERROR_CODES。 */
+  errorCode?: string | null;
+  /** 预扣额度是否已退回。 */
+  quotaRefunded?: boolean;
+  /** queued 状态的排队截止时间。 */
+  queueDeadlineAt?: string | null;
+  /** queued 状态派发时只能使用的账号（严格指定）。 */
+  preferredAccountId?: number | null;
+  /** queued 状态派发时需要排除的账号。 */
+  excludeAccountIds?: number[] | null;
 }
 
 export interface ApiRequestCreateInput {
@@ -144,12 +168,23 @@ export interface ApiRequestCreateInput {
   resolution?: string | null;
   imageCount?: number;
   durationSeconds?: number | null;
+  clientRequestId?: string | null;
+  parentRequestId?: string | null;
+  workflowPhase?: string | null;
+  errorCode?: string | null;
+  quotaRefunded?: boolean;
+  queueDeadlineAt?: string | null;
+  preferredAccountId?: number | null;
+  excludeAccountIds?: number[] | null;
 }
 
 export interface ApiRequestUpdateInput {
   requestId: string;
   status?: ApiRequestStatus;
   message?: string;
+  workflowPhase?: string | null;
+  errorCode?: string | null;
+  quotaRefunded?: boolean;
   doubaoThreadUrl?: string | null;
   rawVideoUrl?: string | null;
   cleanVideoUrl?: string | null;
@@ -204,4 +239,16 @@ export interface GenerateRequestBody {
   resolution?: string | null;
   count?: number;
   n?: number;
+  /** 执行器协议 v2：幂等键。相同键重复提交只返回已有请求，不会二次生成或扣额度。 */
+  clientRequestId?: string | null;
+  /** 执行器协议 v2：重提来源请求 ID。 */
+  parentRequestId?: string | null;
+  /** 执行器协议 v2：严格指定账号；不可用时排队或直接失败，不会换号。 */
+  accountId?: number | string | null;
+  /** 执行器协议 v2：本次不使用的账号。 */
+  excludeAccountIds?: Array<number | string> | string | null;
+  /** 执行器协议 v2：无空闲账号时是否排队（带 clientRequestId 时默认 true）。 */
+  queue?: boolean | string | null;
+  /** 执行器协议 v2：排队最长秒数，默认 600，最大 3600。 */
+  queueTimeoutSeconds?: number | string | null;
 }

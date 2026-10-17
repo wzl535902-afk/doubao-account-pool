@@ -17,9 +17,100 @@ import type {
   OperationLogCreateInput
 } from "./types.js";
 import { modelCost } from "./types.js";
+import { phaseForProgress, type ErrorCode } from "./request-lifecycle.js";
 
 const now = () => new Date().toISOString();
+
+const API_REQUEST_COLUMNS = `
+        api_requests.id,
+        api_requests.request_id AS requestId,
+        api_requests.source,
+        api_requests.model,
+        api_requests.account_id AS accountId,
+        accounts.name AS accountName,
+        accounts.partition AS accountPartition,
+        api_requests.status,
+        api_requests.message,
+        api_requests.prompt,
+        api_requests.reference_image_path AS referenceImagePath,
+        api_requests.reference_image_paths AS referenceImagePaths,
+        api_requests.remove_watermark AS removeWatermark,
+        api_requests.callback_url AS callbackUrl,
+        api_requests.retry_count AS retryCount,
+        api_requests.doubao_thread_url AS doubaoThreadUrl,
+        api_requests.raw_video_url AS rawVideoUrl,
+        api_requests.clean_video_url AS cleanVideoUrl,
+        api_requests.output_video_path AS outputVideoPath,
+        api_requests.aspect_ratio AS aspectRatio,
+        api_requests.duration_seconds AS durationSeconds,
+        api_requests.resolution AS resolution,
+        api_requests.image_count AS imageCount,
+        api_requests.image_urls AS imageUrls,
+        api_requests.output_image_paths AS outputImagePaths,
+        api_requests.created_at AS createdAt,
+        api_requests.updated_at AS updatedAt,
+        api_requests.finished_at AS finishedAt,
+        api_requests.client_request_id AS clientRequestId,
+        api_requests.parent_request_id AS parentRequestId,
+        api_requests.workflow_phase AS workflowPhase,
+        api_requests.submitted_at AS submittedAt,
+        api_requests.heartbeat_at AS heartbeatAt,
+        api_requests.error_code AS errorCode,
+        api_requests.quota_refunded AS quotaRefunded,
+        api_requests.queue_deadline_at AS queueDeadlineAt,
+        api_requests.preferred_account_id AS preferredAccountId,
+        api_requests.exclude_account_ids AS excludeAccountIds`;
+
+const ACTIVE_STATUSES = ["queued", "accepted", "running"] as const;
+
+export interface AccountSelectionOptions {
+  /** 严格指定账号；为空表示任意可用账号。 */
+  accountId?: number | null;
+  /** 本次不使用的账号。 */
+  excludeAccountIds?: number[] | null;
+}
+
+export type AccountAvailability =
+  | { available: true }
+  | { available: false; couldBecomeAvailable: boolean; code: ErrorCode; message: string };
+
+export interface AdmitGenerateInput extends Omit<ApiRequestCreateInput, "status" | "accountId" | "message"> {
+  clientRequestId?: string | null;
+  executorEnabled: boolean;
+  /** 无空闲账号时是否允许排队。 */
+  allowQueue: boolean;
+  queueTimeoutSeconds: number;
+  selection: AccountSelectionOptions;
+}
+
+export type AdmitGenerateResult =
+  | { outcome: "replay"; request: ApiRequest }
+  | { outcome: "accepted"; request: ApiRequest; account: Account; cost: number }
+  | { outcome: "queued"; request: ApiRequest }
+  | { outcome: "rejected"; request: ApiRequest; code: ErrorCode };
+
+export interface ApiRequestQuery {
+  limit?: number;
+  statuses?: ApiRequestStatus[];
+  /** 只返回 updated_at >= since 的请求（ISO 时间）。 */
+  since?: string | null;
+  source?: string | null;
+  clientRequestIdPrefix?: string | null;
+}
+
+export interface FinalizeRequestInput {
+  requestId: string;
+  /** 只有当前状态属于这些值时才会写入（防止覆盖已成功/已失败的结果）。 */
+  expectStatuses: ApiRequestStatus[];
+  message: string;
+  errorCode: ErrorCode;
+  workflowPhase: string;
+  refund: boolean;
+  /** 若该账号上已没有其他活跃请求，则把账号置回 idle。 */
+  releaseAccount: boolean;
+}
 const OPERATION_LOG_RETENTION_DAYS = 3;
+const WORK_ONLY_MESSAGE = "已登录的账号都是豆包工作/飞书个人版，不支持普通豆包 Seedream/Seedance 模型；请登录普通豆包账号";
 
 const DEFAULT_SETTINGS: AppSettings = {
   apiServiceEnabled: true,
@@ -51,8 +142,7 @@ const DEFAULT_SETTINGS: AppSettings = {
 export class AppDatabase {
   private readonly db: Database.Database;
 
-  constructor() {
-    const dbPath = path.join(app.getPath("userData"), "doubao-manager.sqlite3");
+  constructor(dbPath = path.join(app.getPath("userData"), "doubao-manager.sqlite3")) {
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.migrate();
@@ -282,9 +372,20 @@ export class AppDatabase {
     return this.listAccounts();
   }
 
-  findAvailableAccount(model: DoubaoModel): Account | undefined {
+  findAvailableAccount(model: DoubaoModel, options: AccountSelectionOptions = {}): Account | undefined {
     const settings = this.getSettings();
     const requiredQuota = modelCost(settings, model);
+    const exclude = (options.excludeAccountIds ?? []).filter((id) => Number.isInteger(id));
+    const filters: string[] = [];
+    const params: unknown[] = [requiredQuota, now()];
+    if (options.accountId != null) {
+      filters.push("AND id = ?");
+      params.push(options.accountId);
+    }
+    if (exclude.length) {
+      filters.push(`AND id NOT IN (${exclude.map(() => "?").join(", ")})`);
+      params.push(...exclude);
+    }
     return this.db.prepare(`
       SELECT
         id,
@@ -307,6 +408,7 @@ export class AppDatabase {
         AND current_status IN ('idle', 'error')
         AND quota_remaining >= ?
         AND (cooldown_until IS NULL OR cooldown_until <= ?)
+        ${filters.join("\n        ")}
       ORDER BY
         ${
           settings.accountSelectionMode === "lru"
@@ -315,12 +417,12 @@ export class AppDatabase {
         }
         id ASC
       LIMIT 1
-    `).get(requiredQuota, now()) as Account | undefined;
+    `).get(...params) as Account | undefined;
   }
 
-  reserveAvailableAccount(model: DoubaoModel): Account | undefined {
+  reserveAvailableAccount(model: DoubaoModel, options: AccountSelectionOptions = {}): Account | undefined {
     return this.db.transaction(() => {
-      const account = this.findAvailableAccount(model);
+      const account = this.findAvailableAccount(model, options);
       if (!account) return undefined;
       this.markAccountAllocated(account.id, "busy");
       return this.getAccount(account.id);
@@ -387,10 +489,239 @@ export class AppDatabase {
           retry_count = COALESCE(retry_count, 0) + 1,
           status = 'accepted',
           message = ?,
+          -- 新一轮执行：清空上一轮的提交标记/会话/错误码（上一轮仅在平台确认未扣次数时才会换号重试）
+          submitted_at = NULL,
+          doubao_thread_url = NULL,
+          error_code = NULL,
+          workflow_phase = 'queued',
           updated_at = ?
       WHERE request_id = ?
     `).run(accountId, message, now(), requestId);
     return this.getApiRequest(requestId)!;
+  }
+
+  /**
+   * 账号暂不可用时，判断是“稍后可能可用”（忙碌/冷却，可排队）还是“不可能可用”（直接失败）。
+   */
+  describeAccountAvailability(model: DoubaoModel, options: AccountSelectionOptions = {}): AccountAvailability {
+    if (this.findAvailableAccount(model, options)) return { available: true };
+    const cost = modelCost(this.getSettings(), model);
+    const exclude = new Set(options.excludeAccountIds ?? []);
+    const candidates = this.listAccounts().filter((account) =>
+      !exclude.has(account.id) && (options.accountId == null || account.id === options.accountId)
+    );
+    const specific = options.accountId != null;
+    if (specific && candidates.length === 0) {
+      return { available: false, couldBecomeAvailable: false, code: "ACCOUNT_UNAVAILABLE", message: `指定账号 ${options.accountId} 不存在或已被排除` };
+    }
+    const loggedIn = candidates.filter((account) => account.loginStatus === "logged_in");
+    if (loggedIn.length === 0) {
+      return {
+        available: false,
+        couldBecomeAvailable: false,
+        code: specific ? "ACCOUNT_UNAVAILABLE" : "NO_ACCOUNT_LOGIN",
+        message: specific ? `指定账号 ${options.accountId} 未登录` : "没有已登录的豆包账号，请到「账号管理」登录后再试"
+      };
+    }
+    const consumer = loggedIn.filter((account) => account.mediaPageKind !== "work");
+    if (consumer.length === 0) {
+      return { available: false, couldBecomeAvailable: false, code: "ACCOUNT_WORK_PAGE", message: WORK_ONLY_MESSAGE };
+    }
+    const withQuota = consumer.filter((account) => account.quotaRemaining >= cost);
+    if (withQuota.length === 0) {
+      return {
+        available: false,
+        couldBecomeAvailable: false,
+        code: specific ? "ACCOUNT_UNAVAILABLE" : "NO_ACCOUNT_QUOTA",
+        message: specific ? `指定账号 ${options.accountId} 剩余额度不足（需要 ${cost}）` : `所有已登录账号剩余额度不足（需要 ${cost}）`
+      };
+    }
+    return {
+      available: false,
+      couldBecomeAvailable: true,
+      code: specific ? "ACCOUNT_UNAVAILABLE" : "NO_ACCOUNT",
+      message: specific ? `指定账号 ${options.accountId} 正忙或冷却中` : "所有可用账号正忙或冷却中"
+    };
+  }
+
+  /**
+   * 执行器协议 v2 的受理入口：幂等检查 + 选号 + 预扣 + 入库在同一个事务里完成，
+   * 任何一步失败都整体回滚（不会出现“扣了额度却没有请求”的情况）。
+   */
+  admitGenerateRequest(input: AdmitGenerateInput): AdmitGenerateResult {
+    return this.db.transaction((): AdmitGenerateResult => {
+      if (input.clientRequestId) {
+        const existing = this.getApiRequestByClientRequestId(input.clientRequestId);
+        if (existing) return { outcome: "replay", request: existing };
+      }
+      const settings = this.getSettings();
+      const cost = modelCost(settings, input.model);
+      const { executorEnabled: _executorEnabled, allowQueue: _allowQueue, queueTimeoutSeconds: _queueTimeout, selection: _selection, ...createFields } = input;
+      const base: ApiRequestCreateInput = {
+        ...createFields,
+        status: "accepted",
+        clientRequestId: input.clientRequestId ?? null,
+        preferredAccountId: input.selection.accountId ?? null,
+        excludeAccountIds: input.selection.excludeAccountIds?.length ? input.selection.excludeAccountIds : null
+      };
+
+      const account = input.executorEnabled
+        ? this.reserveAvailableAccount(input.model, input.selection)
+        : this.findAvailableAccount(input.model, input.selection);
+      if (account) {
+        this.deductQuota(account.id, input.model);
+        const request = this.createApiRequest({
+          ...base,
+          accountId: account.id,
+          status: "accepted",
+          workflowPhase: "queued",
+          message: input.executorEnabled
+            ? `已接收，已预扣 ${cost} 额度，已进入执行队列`
+            : `已接收，已预扣 ${cost} 额度，自动执行已关闭`
+        });
+        return { outcome: "accepted", request, account: this.getAccount(account.id)!, cost };
+      }
+
+      const availability = this.describeAccountAvailability(input.model, input.selection);
+      if (!availability.available && availability.couldBecomeAvailable && input.allowQueue && input.executorEnabled) {
+        const deadline = new Date(Date.now() + input.queueTimeoutSeconds * 1000).toISOString();
+        const request = this.createApiRequest({
+          ...base,
+          accountId: null,
+          status: "queued",
+          workflowPhase: "queued",
+          queueDeadlineAt: deadline,
+          message: `${availability.message}，已排队等待（最长 ${Math.round(input.queueTimeoutSeconds / 60)} 分钟，未扣额度）`
+        });
+        return { outcome: "queued", request };
+      }
+
+      const code: ErrorCode = availability.available ? "NO_ACCOUNT" : availability.code;
+      const message = availability.available ? "没有可用账号" : availability.message;
+      const request = this.createApiRequest({
+        ...base,
+        accountId: null,
+        status: "failed",
+        workflowPhase: "failed",
+        errorCode: code,
+        quotaRefunded: true,
+        message
+      });
+      return { outcome: "rejected", request, code };
+    })();
+  }
+
+  /**
+   * 为一个 queued 请求选号、预扣并转为 accepted。没有可用账号时返回 null（保持排队）。
+   */
+  dispatchQueuedRequest(requestId: string): { request: ApiRequest; account: Account; cost: number } | null {
+    return this.db.transaction(() => {
+      const request = this.getApiRequest(requestId);
+      if (!request || request.status !== "queued") return null;
+      const selection: AccountSelectionOptions = {
+        accountId: request.preferredAccountId ?? null,
+        excludeAccountIds: request.excludeAccountIds ?? null
+      };
+      const account = this.reserveAvailableAccount(request.model, selection);
+      if (!account) return null;
+      this.deductQuota(account.id, request.model);
+      const cost = modelCost(this.getSettings(), request.model);
+      const timestamp = now();
+      this.db.prepare(`
+        UPDATE api_requests
+        SET account_id = ?, status = 'accepted', workflow_phase = 'queued', queue_deadline_at = NULL,
+            message = ?, updated_at = ?
+        WHERE request_id = ? AND status = 'queued'
+      `).run(account.id, `已分配账号，已预扣 ${cost} 额度，已进入执行队列`, timestamp, requestId);
+      return { request: this.getApiRequest(requestId)!, account: this.getAccount(account.id)!, cost };
+    })();
+  }
+
+  listQueuedApiRequests(): ApiRequest[] {
+    return this.db.prepare(`
+      SELECT ${API_REQUEST_COLUMNS}
+      FROM api_requests
+      LEFT JOIN accounts ON accounts.id = api_requests.account_id
+      WHERE api_requests.status = 'queued'
+      ORDER BY api_requests.id ASC
+    `).all().map(normalizeApiRequest);
+  }
+
+  listActiveApiRequests(): ApiRequest[] {
+    return this.db.prepare(`
+      SELECT ${API_REQUEST_COLUMNS}
+      FROM api_requests
+      LEFT JOIN accounts ON accounts.id = api_requests.account_id
+      WHERE api_requests.status IN (${ACTIVE_STATUSES.map(() => "?").join(", ")})
+      ORDER BY api_requests.id ASC
+    `).all(...ACTIVE_STATUSES).map(normalizeApiRequest);
+  }
+
+  /** 已把提示词提交给豆包：此后任何自动流程都不得重新生成（铁律 3）。只记录首次时间。 */
+  markApiRequestSubmitted(requestId: string) {
+    this.db.prepare(`
+      UPDATE api_requests
+      SET submitted_at = COALESCE(submitted_at, ?), updated_at = ?
+      WHERE request_id = ?
+    `).run(now(), now(), requestId);
+  }
+
+  touchApiRequestHeartbeat(requestId: string) {
+    this.db.prepare(`UPDATE api_requests SET heartbeat_at = ? WHERE request_id = ?`).run(now(), requestId);
+  }
+
+  /**
+   * 原子收尾（孤儿/卡死/放弃/排队超时）：仅在状态符合预期时写入，必要时退款并释放账号。
+   * 返回更新后的请求；状态已不符合预期时返回 null（例如已经成功）。
+   */
+  finalizeApiRequest(input: FinalizeRequestInput): ApiRequest | null {
+    return this.db.transaction(() => {
+      const request = this.getApiRequest(input.requestId);
+      if (!request || !input.expectStatuses.includes(request.status)) return null;
+      const timestamp = now();
+      const shouldRefund = input.refund && request.accountId != null && !request.quotaRefunded && request.status !== "queued";
+      if (shouldRefund) this.refundQuota(request.accountId!, request.model);
+      this.db.prepare(`
+        UPDATE api_requests
+        SET status = 'failed', message = ?, error_code = ?, workflow_phase = ?,
+            quota_refunded = CASE WHEN ? THEN 1 WHEN status = 'queued' THEN 1 ELSE quota_refunded END,
+            queue_deadline_at = NULL, updated_at = ?, finished_at = COALESCE(finished_at, ?)
+        WHERE request_id = ?
+      `).run(input.message, input.errorCode, input.workflowPhase, shouldRefund ? 1 : 0, timestamp, timestamp, input.requestId);
+      if (input.releaseAccount && request.accountId != null) this.releaseAccountIfIdle(request.accountId, input.requestId);
+      return this.getApiRequest(input.requestId)!;
+    })();
+  }
+
+  /** 账号上没有其他 accepted/running 请求时，把 busy 账号置回 idle。 */
+  releaseAccountIfIdle(accountId: number, ignoreRequestId?: string) {
+    const other = this.db.prepare(`
+      SELECT 1 FROM api_requests
+      WHERE account_id = ? AND status IN ('accepted', 'running') AND request_id != ?
+      LIMIT 1
+    `).get(accountId, ignoreRequestId ?? "");
+    if (other) return false;
+    this.db.prepare(`
+      UPDATE accounts SET current_status = 'idle', updated_at = ?
+      WHERE id = ? AND current_status = 'busy'
+    `).run(now(), accountId);
+    return true;
+  }
+
+  /** 释放所有“busy 但没有任何活跃请求”的账号（启动清扫/周期清扫）。 */
+  releaseOrphanBusyAccounts(): number[] {
+    const rows = this.db.prepare(`
+      SELECT id FROM accounts
+      WHERE current_status = 'busy'
+        AND NOT EXISTS (
+          SELECT 1 FROM api_requests
+          WHERE api_requests.account_id = accounts.id AND api_requests.status IN ('accepted', 'running')
+        )
+    `).all() as Array<{ id: number }>;
+    const timestamp = now();
+    const update = this.db.prepare(`UPDATE accounts SET current_status = 'idle', updated_at = ? WHERE id = ?`);
+    for (const row of rows) update.run(timestamp, row.id);
+    return rows.map((row) => row.id);
   }
 
   getSettings(): AppSettings {
@@ -444,35 +775,7 @@ export class AppDatabase {
 
   listApiRequests(limit = 100): ApiRequest[] {
     return this.db.prepare(`
-      SELECT
-        api_requests.id,
-        api_requests.request_id AS requestId,
-        api_requests.source,
-        api_requests.model,
-        api_requests.account_id AS accountId,
-        accounts.name AS accountName,
-        accounts.partition AS accountPartition,
-        api_requests.status,
-        api_requests.message,
-        api_requests.prompt,
-        api_requests.reference_image_path AS referenceImagePath,
-        api_requests.reference_image_paths AS referenceImagePaths,
-        api_requests.remove_watermark AS removeWatermark,
-        api_requests.callback_url AS callbackUrl,
-        api_requests.retry_count AS retryCount,
-        api_requests.doubao_thread_url AS doubaoThreadUrl,
-        api_requests.raw_video_url AS rawVideoUrl,
-        api_requests.clean_video_url AS cleanVideoUrl,
-        api_requests.output_video_path AS outputVideoPath,
-        api_requests.aspect_ratio AS aspectRatio,
-        api_requests.duration_seconds AS durationSeconds,
-        api_requests.resolution AS resolution,
-        api_requests.image_count AS imageCount,
-        api_requests.image_urls AS imageUrls,
-        api_requests.output_image_paths AS outputImagePaths,
-        api_requests.created_at AS createdAt,
-        api_requests.updated_at AS updatedAt,
-        api_requests.finished_at AS finishedAt
+      SELECT ${API_REQUEST_COLUMNS}
       FROM api_requests
       LEFT JOIN accounts ON accounts.id = api_requests.account_id
       ORDER BY api_requests.id DESC
@@ -480,41 +783,54 @@ export class AppDatabase {
     `).all(limit).map(normalizeApiRequest);
   }
 
+  queryApiRequests(query: ApiRequestQuery = {}): ApiRequest[] {
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (query.statuses?.length) {
+      where.push(`api_requests.status IN (${query.statuses.map(() => "?").join(", ")})`);
+      params.push(...query.statuses);
+    }
+    if (query.since) {
+      where.push("api_requests.updated_at >= ?");
+      params.push(query.since);
+    }
+    if (query.source) {
+      where.push("api_requests.source = ?");
+      params.push(query.source);
+    }
+    if (query.clientRequestIdPrefix) {
+      where.push("substr(api_requests.client_request_id, 1, ?) = ?");
+      params.push(query.clientRequestIdPrefix.length, query.clientRequestIdPrefix);
+    }
+    const limit = Math.max(1, Math.min(1000, Math.trunc(query.limit ?? 100) || 100));
+    params.push(limit);
+    return this.db.prepare(`
+      SELECT ${API_REQUEST_COLUMNS}
+      FROM api_requests
+      LEFT JOIN accounts ON accounts.id = api_requests.account_id
+      ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+      ORDER BY api_requests.id DESC
+      LIMIT ?
+    `).all(...params).map(normalizeApiRequest);
+  }
+
   getApiRequest(requestId: string): ApiRequest | undefined {
     const row = this.db.prepare(`
-      SELECT
-        api_requests.id,
-        api_requests.request_id AS requestId,
-        api_requests.source,
-        api_requests.model,
-        api_requests.account_id AS accountId,
-        accounts.name AS accountName,
-        accounts.partition AS accountPartition,
-        api_requests.status,
-        api_requests.message,
-        api_requests.prompt,
-        api_requests.reference_image_path AS referenceImagePath,
-        api_requests.reference_image_paths AS referenceImagePaths,
-        api_requests.remove_watermark AS removeWatermark,
-        api_requests.callback_url AS callbackUrl,
-        api_requests.retry_count AS retryCount,
-        api_requests.doubao_thread_url AS doubaoThreadUrl,
-        api_requests.raw_video_url AS rawVideoUrl,
-        api_requests.clean_video_url AS cleanVideoUrl,
-        api_requests.output_video_path AS outputVideoPath,
-        api_requests.aspect_ratio AS aspectRatio,
-        api_requests.duration_seconds AS durationSeconds,
-        api_requests.resolution AS resolution,
-        api_requests.image_count AS imageCount,
-        api_requests.image_urls AS imageUrls,
-        api_requests.output_image_paths AS outputImagePaths,
-        api_requests.created_at AS createdAt,
-        api_requests.updated_at AS updatedAt,
-        api_requests.finished_at AS finishedAt
+      SELECT ${API_REQUEST_COLUMNS}
       FROM api_requests
       LEFT JOIN accounts ON accounts.id = api_requests.account_id
       WHERE api_requests.request_id = ?
     `).get(requestId);
+    return row ? normalizeApiRequest(row) : undefined;
+  }
+
+  getApiRequestByClientRequestId(clientRequestId: string): ApiRequest | undefined {
+    const row = this.db.prepare(`
+      SELECT ${API_REQUEST_COLUMNS}
+      FROM api_requests
+      LEFT JOIN accounts ON accounts.id = api_requests.account_id
+      WHERE api_requests.client_request_id = ?
+    `).get(clientRequestId);
     return row ? normalizeApiRequest(row) : undefined;
   }
 
@@ -537,11 +853,19 @@ export class AppDatabase {
         resolution,
         image_count,
         duration_seconds,
+        client_request_id,
+        parent_request_id,
+        workflow_phase,
+        error_code,
+        quota_refunded,
+        queue_deadline_at,
+        preferred_account_id,
+        exclude_account_ids,
         created_at,
         updated_at,
         finished_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.requestId,
       input.source || "local-api",
@@ -558,6 +882,14 @@ export class AppDatabase {
       input.resolution || null,
       Math.min(4, Math.max(1, input.imageCount || 1)),
       input.durationSeconds ?? null,
+      input.clientRequestId || null,
+      input.parentRequestId || null,
+      input.workflowPhase ?? phaseForProgress(input.message, input.status, null),
+      input.errorCode || null,
+      input.quotaRefunded ? 1 : 0,
+      input.queueDeadlineAt || null,
+      input.preferredAccountId ?? null,
+      input.excludeAccountIds?.length ? JSON.stringify(input.excludeAccountIds) : null,
       timestamp,
       timestamp,
       input.status === "failed" || input.status === "success" || input.status === "stopped" ? timestamp : null
@@ -592,6 +924,9 @@ export class AppDatabase {
         output_video_path = ?,
         image_urls = ?,
         output_image_paths = ?,
+        workflow_phase = ?,
+        error_code = ?,
+        quota_refunded = ?,
         updated_at = ?,
         finished_at = COALESCE(?, finished_at)
       WHERE request_id = ?
@@ -608,6 +943,9 @@ export class AppDatabase {
       input.outputImagePaths === undefined
         ? (existing.outputImagePaths ? JSON.stringify(existing.outputImagePaths) : null)
         : (input.outputImagePaths ? JSON.stringify(input.outputImagePaths) : null),
+      input.workflowPhase === undefined ? (existing.workflowPhase ?? null) : input.workflowPhase,
+      input.errorCode === undefined ? (existing.errorCode ?? null) : input.errorCode,
+      (input.quotaRefunded === undefined ? existing.quotaRefunded : input.quotaRefunded) ? 1 : 0,
       now(),
       finishedAt,
       input.requestId
@@ -663,6 +1001,27 @@ export class AppDatabase {
       ORDER BY operation_logs.id DESC
       LIMIT ?
     `).all(Math.max(1, Math.min(2000, limit))).map(normalizeOperationLog);
+  }
+
+  listOperationLogsForRequest(requestId: string, limit = 300): OperationLog[] {
+    return this.db.prepare(`
+      SELECT
+        operation_logs.id,
+        operation_logs.request_id AS requestId,
+        operation_logs.account_id AS accountId,
+        accounts.name AS accountName,
+        accounts.partition AS accountPartition,
+        operation_logs.action,
+        operation_logs.status,
+        operation_logs.message,
+        operation_logs.target_url AS targetUrl,
+        operation_logs.created_at AS createdAt
+      FROM operation_logs
+      LEFT JOIN accounts ON accounts.id = operation_logs.account_id
+      WHERE operation_logs.request_id = ?
+      ORDER BY operation_logs.id ASC
+      LIMIT ?
+    `).all(requestId, Math.max(1, Math.min(2000, limit))).map(normalizeOperationLog);
   }
 
   getOperationLog(id: number): OperationLog | undefined {
@@ -761,6 +1120,22 @@ export class AppDatabase {
     this.addColumnIfMissing("api_requests", "image_urls", "TEXT");
     this.addColumnIfMissing("api_requests", "output_image_paths", "TEXT");
     this.addColumnIfMissing("api_requests", "finished_at", "TEXT");
+    // 执行器协议 v2（部分列在旧库中已存在：workflow_phase/submitted_at/error_code）
+    this.addColumnIfMissing("api_requests", "workflow_phase", "TEXT");
+    this.addColumnIfMissing("api_requests", "submitted_at", "TEXT");
+    this.addColumnIfMissing("api_requests", "error_code", "TEXT");
+    this.addColumnIfMissing("api_requests", "heartbeat_at", "TEXT");
+    this.addColumnIfMissing("api_requests", "client_request_id", "TEXT");
+    this.addColumnIfMissing("api_requests", "parent_request_id", "TEXT");
+    this.addColumnIfMissing("api_requests", "quota_refunded", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("api_requests", "queue_deadline_at", "TEXT");
+    this.addColumnIfMissing("api_requests", "preferred_account_id", "INTEGER");
+    this.addColumnIfMissing("api_requests", "exclude_account_ids", "TEXT");
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_api_requests_client_request_id
+        ON api_requests(client_request_id) WHERE client_request_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_api_requests_status ON api_requests(status);
+    `);
   }
 
   private cleanInvalidSuccessfulResults() {
@@ -844,6 +1219,18 @@ function parseJsonStringArray(value: unknown): string[] | null {
   return null;
 }
 
+function parseJsonNumberArray(value: unknown): number[] | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) return null;
+    const ids = parsed.map((item) => Number(item)).filter((item) => Number.isInteger(item));
+    return ids.length ? ids : null;
+  } catch {
+    return null;
+  }
+}
+
 function normalizeApiRequest(row: unknown): ApiRequest {
   const request = row as ApiRequest & { removeWatermark: number | boolean };
   const rawPaths = (request as { referenceImagePaths?: unknown }).referenceImagePaths;
@@ -866,7 +1253,17 @@ function normalizeApiRequest(row: unknown): ApiRequest {
     imageUrls: parseJsonStringArray((request as { imageUrls?: unknown }).imageUrls),
     outputImagePaths: parseJsonStringArray((request as { outputImagePaths?: unknown }).outputImagePaths),
     imageCount: Number((request as { imageCount?: unknown }).imageCount ?? 1) || 1,
-    removeWatermark: Boolean(request.removeWatermark)
+    removeWatermark: Boolean(request.removeWatermark),
+    clientRequestId: request.clientRequestId ?? null,
+    parentRequestId: request.parentRequestId ?? null,
+    workflowPhase: request.workflowPhase ?? null,
+    submittedAt: request.submittedAt ?? null,
+    heartbeatAt: request.heartbeatAt ?? null,
+    errorCode: request.errorCode ?? null,
+    quotaRefunded: Boolean(request.quotaRefunded),
+    queueDeadlineAt: request.queueDeadlineAt ?? null,
+    preferredAccountId: request.preferredAccountId == null ? null : Number(request.preferredAccountId),
+    excludeAccountIds: parseJsonNumberArray((request as { excludeAccountIds?: unknown }).excludeAccountIds)
   };
 }
 
