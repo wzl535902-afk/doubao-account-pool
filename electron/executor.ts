@@ -30,6 +30,7 @@ import {
   ABORT_GRACE_MS,
   HEARTBEAT_INTERVAL_MS,
   MIN_PROMPT_LENGTH_FOR_FUZZY_RECOVERY,
+  canFailoverToAnotherAccount,
   classifyFailure,
   errorInfo,
   hardDeadlineMs,
@@ -639,9 +640,14 @@ export class DoubaoExecutor {
       }
       // 池宪法④：失败冷却退避 + 自动换号重试（仅可重试类失败，避免重复计费）。
       // 严格指定账号（preferredAccountId）时不换号；换号时同样遵守 excludeAccountIds。
+      // 提示词发出前的账号/页面类失败（如该号页面没有视频模型控件）也换号：平台未扣额度，换号不重复计费。
       if (
         !accountBlocked &&
-        isRefundableExecutionError(failure) &&
+        canFailoverToAnotherAccount({
+          message: errorMessage(failure),
+          submitted: submittedToDoubao,
+          refundableFailure: isRefundableExecutionError(failure)
+        }) &&
         request.preferredAccountId == null &&
         settings.requestRetryLimit > 0 &&
         (request.retryCount ?? 0) < settings.requestRetryLimit
@@ -1305,6 +1311,9 @@ async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
     await wait(1500);
   }
   await diag("failed-all-rounds");
+  // 页面诊断轨迹只存在于执行窗口里，窗口一关就丢；失败时打到日志，便于定位个别账号的页面差异。
+  const trail = await runPageScript<string>(win, `(() => { try { return (window.__vidDiag || []).join(" | "); } catch (e) { return ""; } })()`).catch(() => "");
+  console.warn(`[video-mode] 选择视频模型失败：${String(trail).slice(0, 1500)}`);
   throw new Error(`未能选择请求的视频模型 ${isStandard ? "Seedance 2.0" : `Seedance 2.0 ${target}`}；当前模型=${await readVideoModelChip(win) || "无模型控件"}；未发送提示词`);
 }
 

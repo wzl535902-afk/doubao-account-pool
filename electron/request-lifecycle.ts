@@ -194,6 +194,29 @@ export function classifyFailure(message: string | null | undefined, submitted: b
   return PRE_SUBMIT_REMAP[code] ?? code;
 }
 
+/** 提示词发出前就失败、但换号也没用的错误（请求本身有问题）。 */
+const NON_ACCOUNT_PRE_SUBMIT_CODES: ReadonlySet<ErrorCode> = new Set<ErrorCode>([
+  "PARAM_INVALID",
+  "EXECUTOR_MISCONFIGURED",
+  "CONTENT_REJECTED"
+]);
+
+/**
+ * 失败后能否换号重试（不重复计费）：
+ * - 执行器明确标记为可退款的页面失败；或
+ * - 提示词尚未发送（平台没扣额度），且不是“请求本身有问题”的错误。
+ *   典型：某账号页面没有视频模型控件 / 选不中模型（UI_PARAM_UNCONFIRMED）——换个号就能出。
+ */
+export function canFailoverToAnotherAccount(input: {
+  message: string | null | undefined;
+  submitted: boolean;
+  refundableFailure: boolean;
+}): boolean {
+  if (input.refundableFailure) return true;
+  if (input.submitted) return false;
+  return !NON_ACCOUNT_PRE_SUBMIT_CODES.has(classifyFailure(input.message, false));
+}
+
 export interface FailureFlags {
   /** 可在原豆包会话里“找回结果”（不重新生成、不再扣额度）。 */
   recoverable: boolean;

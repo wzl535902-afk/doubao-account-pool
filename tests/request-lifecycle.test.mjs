@@ -8,6 +8,7 @@ const buildDir = process.env.POOL_TEST_BUILD_DIR
   : new URL("../dist-electron", import.meta.url).href;
 const {
   ERROR_CODES,
+  canFailoverToAnotherAccount,
   classifyFailure,
   failureFlags,
   phaseForProgress,
@@ -194,4 +195,19 @@ test("request option parsing", () => {
   assert.equal(parseOptionalAccountId(undefined), null);
   assert.equal(parseOptionalAccountId("12"), 12);
   assert.ok(Number.isNaN(parseOptionalAccountId("abc")));
+});
+
+test("canFailoverToAnotherAccount: pre-submit page failures move to another account", () => {
+  const noModel = "未能选择请求的视频模型 Seedance 2.0 Mini；当前模型=无模型控件；未发送提示词";
+  assert.equal(canFailoverToAnotherAccount({ message: noModel, submitted: false, refundableFailure: false }), true);
+  assert.equal(canFailoverToAnotherAccount({ message: "未能切换到视频模式", submitted: false, refundableFailure: false }), true);
+  assert.equal(canFailoverToAnotherAccount({ message: "页面加载失败 ERR_TIMED_OUT", submitted: false, refundableFailure: false }), true);
+});
+
+test("canFailoverToAnotherAccount: never re-bill or retry hopeless requests", () => {
+  assert.equal(canFailoverToAnotherAccount({ message: "未能选择请求的视频模型", submitted: true, refundableFailure: false }), false, "submitted: platform may have billed");
+  assert.equal(canFailoverToAnotherAccount({ message: "aspect_ratio 参数无效", submitted: false, refundableFailure: false }), false);
+  assert.equal(canFailoverToAnotherAccount({ message: "未配置去水印 Token", submitted: false, refundableFailure: false }), false);
+  assert.equal(canFailoverToAnotherAccount({ message: "内容违规，无法为你生成", submitted: false, refundableFailure: false }), false);
+  assert.equal(canFailoverToAnotherAccount({ message: "任何", submitted: true, refundableFailure: true }), true, "explicit refundable page failure keeps old behaviour");
 });

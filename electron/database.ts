@@ -21,6 +21,19 @@ import { phaseForProgress, type ErrorCode } from "./request-lifecycle.js";
 
 const now = () => new Date().toISOString();
 
+const pad2 = (value: number) => String(value).padStart(2, "0");
+
+/**
+ * 额度日（本地时区 YYYY-MM-DD）：以 dailyResetTime（HH:MM，本地时间）为日界。
+ * 例如 dailyResetTime="04:00" 时，本地 03:59 仍算前一天的额度日。
+ */
+export const quotaDayKey = (at: Date, dailyResetTime: string): string => {
+  const match = /^(\d{1,2}):(\d{2})$/u.exec(String(dailyResetTime ?? "").trim());
+  const offsetMinutes = match ? Math.min(23, Number(match[1])) * 60 + Math.min(59, Number(match[2])) : 0;
+  const shifted = new Date(at.getTime() - offsetMinutes * 60_000);
+  return `${shifted.getFullYear()}-${pad2(shifted.getMonth() + 1)}-${pad2(shifted.getDate())}`;
+};
+
 const API_REQUEST_COLUMNS = `
         api_requests.id,
         api_requests.request_id AS requestId,
@@ -218,6 +231,7 @@ export class AppDatabase {
   }
 
   listAccounts(): Account[] {
+    this.rolloverDailyQuotas();
     return this.db.prepare(`
       SELECT
         id,
@@ -351,9 +365,10 @@ export class AppDatabase {
         fast_used_today = 0,
         quota_remaining = daily_quota_limit,
         quota_used_today = 0,
+        quota_day = ?,
         updated_at = ?
       WHERE id = ?
-    `).run(now(), id);
+    `).run(this.currentQuotaDay(), now(), id);
     return this.getAccount(id)!;
   }
 
@@ -367,12 +382,77 @@ export class AppDatabase {
         fast_used_today = 0,
         quota_remaining = daily_quota_limit,
         quota_used_today = 0,
+        quota_day = ?,
         updated_at = ?
-    `).run(now());
+    `).run(this.currentQuotaDay(), now());
     return this.listAccounts();
   }
 
+  /** 当前额度日（按设置里的 dailyResetTime 切日）。 */
+  currentQuotaDay(at: Date = new Date()): string {
+    return quotaDayKey(at, this.getSettings().dailyResetTime);
+  }
+
+  /**
+   * 每日额度自动回满。此前引擎只有手动「重置额度」，quota_used_today 会一直累加，
+   * 账号用完一次就永久没额度（10-17 起豆包全部 NO_ACCOUNT_QUOTA 的根因）。
+   *
+   * 每个账号记自己的额度日 quota_day：
+   * - quota_day 为空（老数据/新账号）：只补记，不清零。按 last_used_at 推断当天，
+   *   从没用过的记为今天；这样迁移不会冲掉手动设置的额度。
+   * - quota_day 不是当前额度日：额度回满（mini/fast/总额度），quota_day 记为今天。
+   * 幂等、开销极小，可在任意读写入口前调用。返回本次回满的账号 id。
+   */
+  rolloverDailyQuotas(at: Date = new Date()): number[] {
+    const resetTime = this.getSettings().dailyResetTime;
+    const today = quotaDayKey(at, resetTime);
+    return this.db.transaction(() => {
+      const unstamped = this.db.prepare(`SELECT id, last_used_at AS lastUsedAt FROM accounts WHERE quota_day IS NULL`)
+        .all() as Array<{ id: number; lastUsedAt: string | null }>;
+      if (unstamped.length) {
+        const stamp = this.db.prepare(`UPDATE accounts SET quota_day = ? WHERE id = ?`);
+        for (const row of unstamped) {
+          const used = row.lastUsedAt ? new Date(row.lastUsedAt) : null;
+          const day = used && Number.isFinite(used.getTime()) ? quotaDayKey(used, resetTime) : today;
+          stamp.run(day, row.id);
+        }
+      }
+      const stale = this.db.prepare(`SELECT id FROM accounts WHERE quota_day != ?`).all(today) as Array<{ id: number }>;
+      if (!stale.length) return [];
+      const timestamp = now();
+      const reset = this.db.prepare(`
+        UPDATE accounts
+        SET
+          mini_remaining = mini_daily_limit,
+          mini_used_today = 0,
+          fast_remaining = fast_daily_limit,
+          fast_used_today = 0,
+          quota_remaining = daily_quota_limit,
+          quota_used_today = 0,
+          quota_day = ?,
+          updated_at = ?
+        WHERE id = ?
+      `);
+      for (const row of stale) reset.run(today, timestamp, row.id);
+      return stale.map((row) => row.id);
+    })();
+  }
+
+  /**
+   * 把号池账号绑定到账号枢纽 ID（存在 name 字段，作为 hub↔pool 的稳定身份）。
+   * 已被其他账号占用时不改，返回 false。
+   */
+  bindHubId(id: number, hubId: string): boolean {
+    const value = String(hubId ?? "").trim();
+    if (!value) return false;
+    const owner = this.db.prepare(`SELECT id FROM accounts WHERE name = ? AND id != ?`).get(value, id);
+    if (owner) return false;
+    this.db.prepare(`UPDATE accounts SET name = ?, updated_at = ? WHERE id = ? AND name != ?`).run(value, now(), id, value);
+    return true;
+  }
+
   findAvailableAccount(model: DoubaoModel, options: AccountSelectionOptions = {}): Account | undefined {
+    this.rolloverDailyQuotas();
     const settings = this.getSettings();
     const requiredQuota = modelCost(settings, model);
     const exclude = (options.excludeAccountIds ?? []).filter((id) => Number.isInteger(id));
@@ -430,6 +510,7 @@ export class AppDatabase {
   }
 
   deductQuota(accountId: number, model: DoubaoModel): Account {
+    this.rolloverDailyQuotas();
     const settings = this.getSettings();
     const cost = modelCost(settings, model);
     const timestamp = now();
@@ -438,9 +519,10 @@ export class AppDatabase {
       SET quota_remaining = MAX(0, quota_remaining - ?),
           quota_used_today = quota_used_today + ?,
           last_used_at = ?,
+          quota_day = ?,
           updated_at = ?
       WHERE id = ?
-    `).run(cost, cost, timestamp, timestamp, accountId);
+    `).run(cost, cost, timestamp, quotaDayKey(new Date(), settings.dailyResetTime), timestamp, accountId);
     return this.getAccount(accountId)!;
   }
 
@@ -1109,6 +1191,7 @@ export class AppDatabase {
     this.addColumnIfMissing("accounts", "quota_remaining", "INTEGER NOT NULL DEFAULT 10");
     this.addColumnIfMissing("accounts", "quota_used_today", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("accounts", "cooldown_until", "TEXT");
+    this.addColumnIfMissing("accounts", "quota_day", "TEXT");
     this.addColumnIfMissing("accounts", "mini_daily_limit", "INTEGER NOT NULL DEFAULT 5");
     this.addColumnIfMissing("accounts", "mini_remaining", "INTEGER NOT NULL DEFAULT 5");
     this.addColumnIfMissing("accounts", "mini_used_today", "INTEGER NOT NULL DEFAULT 0");

@@ -235,17 +235,20 @@ class LocalApiServer {
         }
         // find-or-create：幂等键优先 hubId（藏进 name 字段做匹配），显示名用 hint（=label）
         // 兼容历史：早期 remark 直接存过 hubId/accountId
-        let account = this.database
-          .listAccounts()
-          .find(
-            (item) =>
-              (hubId !== "" && item.name === hubId) ||
-              item.remark === hint ||
-              (hubId !== "" && item.remark === hubId),
-          );
+        // 匹配按优先级逐级找，不再“任一命中”：显示名撞名时不能抢走别的枢纽账号的行。
+        const known = this.database.listAccounts();
+        const isHubIdName = (name: string) => /^acct-/u.test(name);
+        let account =
+          (hubId !== "" ? known.find((item) => item.name === hubId) : undefined) ??
+          (hubId !== "" ? known.find((item) => item.remark === hubId) : undefined) ??
+          known.find((item) => item.remark === hint && (hubId === "" || !isHubIdName(item.name)));
         if (!account) {
           account = this.database.createAccount({ remark: hint });
           recordOperation(null, account.id, "同步枢纽账号", "success", `已从账号枢纽接入 ${hint}`);
+        }
+        // 稳定身份：hubId 写进 name（此前只在注释里这么说，新建账号从未写入，导致只能按显示名匹配）
+        if (hubId !== "" && account.name !== hubId && this.database.bindHubId(account.id, hubId)) {
+          account = this.database.getAccount(account.id) ?? account;
         }
         if (account && hint !== "" && hint !== hubId && account.remark !== hint) {
           // 显示名自愈：历史遗留（remark=ID）刷新为当前显示名（label）
@@ -1206,6 +1209,21 @@ if (!hasSingleInstanceLock) {
       }
     });
     // 启动清扫：上次进程留下的 accepted/running 都是孤儿（内存队列已丢失）。
+    // 每日额度自动回满：启动补一次，之后每分钟检查一次跨日（按设置 dailyResetTime 切日）。
+    const rolloverQuotas = (reason: string) => {
+      try {
+        const resetIds = db.rolloverDailyQuotas();
+        if (resetIds.length) {
+          log.info(`每日额度回满（${reason}）：账号 ${resetIds.join(", ")}`);
+          notifyDataChanged();
+          supervisor?.dispatchQueued();
+        }
+      } catch (error) {
+        log.error("每日额度回满失败", error);
+      }
+    };
+    rolloverQuotas("startup");
+    setInterval(() => rolloverQuotas("timer"), 60_000).unref();
     const swept = supervisor.sweepOrphans("restart");
     if (swept.length) log.warn(`启动清扫：收尾 ${swept.length} 个中断请求`, swept.map((item) => `${item.requestId}:${item.errorCode}`));
     supervisor.start();
