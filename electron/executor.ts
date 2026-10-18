@@ -937,13 +937,16 @@ export class DoubaoExecutor {
     const visible = settings.showExecutorWindow;
     // 豆包页面在 hidden 窗口下会降级（编辑器挂起、上传失败、视频卡片不渲染）：
     // 默认用"幽灵窗口"——上屏正常渲染（保证视频卡片/媒体懒加载生效），
-    // 但对用户完全不可见（opacity 0）且鼠标事件穿透（不挡任何点击）。
+    // 但对用户完全不可见且鼠标事件穿透（不挡任何点击）。
+    // 创建时 show:false + 初始 opacity:0，再 showInactive 上屏——避免
+    // "先可见一帧再 setOpacity(0)"的闪窗（2026-10-18 修）。
     const win = new BrowserWindow({
       width: 1320,
       height: 860,
       x: visible ? undefined : 0,
       y: visible ? undefined : 0,
-      show: true,
+      show: false,
+      opacity: visible ? 1 : 0,
       focusable: visible,
       skipTaskbar: !visible,
       title: `豆包执行器 - ${titleName}`,
@@ -958,6 +961,9 @@ export class DoubaoExecutor {
     if (!visible) {
       win.setOpacity(0);
       win.setIgnoreMouseEvents(true);
+      win.showInactive(); // 零透明度上屏：首帧即不可见，同时保证豆包页面不降级
+    } else {
+      win.show();
     }
     // 交给看门狗：判定卡死/放弃时销毁该窗口，让挂起的页面调用尽快失败。
     this.runs.registerWindow(win);
