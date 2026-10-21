@@ -292,12 +292,36 @@ export class DoubaoExecutor {
         status: "running",
         message: threadUrl ? "正在打开本次豆包会话找回结果" : "未记录会话地址，正在按提示词定位豆包已生成视频"
       });
-      const recovery = await findGeneratedConversationAndCopyShare(
+      let recovery = await findGeneratedConversationAndCopyShare(
         win,
         request.prompt,
         threadUrl,
         { strict: Boolean(threadUrl) }
       );
+      // 会话地址失效兜底：豆包把 /chat/<id> 重定向回 /chat，说明这段会话已不在本账号
+      // （被删，或视频实际是别的账号生成的），此时严格模式必然「提示词匹配 0 条」。
+      // 退化为按提示词在本账号会话列表里定位；提示词过短不冒险（避免认领别人的视频），
+      // 命中后仍要过 assertResultUnique 的重复结果校验。
+      if (
+        !recovery.cleanVideoUrl &&
+        !recovery.shareUrl &&
+        threadUrl &&
+        normalizeComparableText(request.prompt).length >= MIN_PROMPT_LENGTH_FOR_FUZZY_RECOVERY
+      ) {
+        const fuzzy = await findGeneratedConversationAndCopyShare(win, request.prompt, null, {
+          strict: false
+        });
+        if (fuzzy.cleanVideoUrl || fuzzy.shareUrl) {
+          // 两个返回值运行期形状完全一致，仅类型推断把 shareFailureReason 收窄成 null 了
+          recovery = {
+            ...fuzzy,
+            shareFailureReason: fuzzy.shareFailureReason ?? recovery.shareFailureReason
+          } as typeof recovery;
+        } else {
+          recovery.shareFailureReason =
+            `${recovery.shareFailureReason || "会话地址已失效"}；按提示词全量定位也未命中（匹配 ${fuzzy.promptMatchCount} 条）`;
+        }
+      }
       const recoveredThreadUrl = recovery.conversationUrl || threadUrl || request.doubaoThreadUrl;
       if (recovery.cleanVideoUrl) {
         // 页面数据直接解析到无水印原片（与正常生成同一路径），无需分享链接。
