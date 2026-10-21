@@ -2667,9 +2667,25 @@ async function findGeneratedConversationAndCopyShare(
 async function waitForGeneratedVideoCard(win: BrowserWindow, timeoutMs: number) {
   const startedAt = Date.now();
   let state = await inspectGenerationPage(win);
+  let tick = 0;
   while (Date.now() - startedAt < timeoutMs) {
     if (state.failureMessage || (state.generated && state.videoCardCount > 0)) return state;
     await wait(500);
+    // 豆包会话是虚拟滚动：视频卡片在消息列表底部，不滚到底可能永远不进 DOM，
+    // 表现为「提示词匹配到了、但确认已生成 0 条」→ 找回判死。每 3 秒滚一次。
+    tick += 1;
+    if (tick % 6 === 0) {
+      await runPageScript(
+        win,
+        `(() => {
+           const sc = document.scrollingElement || document.body;
+           sc.scrollTop = sc.scrollHeight;
+           const panes = Array.from(document.querySelectorAll('[class*="scroll"], [data-testid*="chat"]'));
+           for (const pane of panes) { try { pane.scrollTop = pane.scrollHeight; } catch {} }
+           window.dispatchEvent(new Event("scroll"));
+         })()`
+      ).catch(() => {});
+    }
     state = await inspectGenerationPage(win);
   }
   return state;
