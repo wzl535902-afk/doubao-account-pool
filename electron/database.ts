@@ -1247,14 +1247,16 @@ export class AppDatabase {
   }
 
   private cleanInvalidSuccessfulResults() {
+    // 只把「确实没有任何可用视频地址」的历史行判死；并且绝不抹掉地址列——
+    // 以前这里把 raw/clean/output 三个 URL 全置 NULL，账号里明明生成好的视频
+    // 也永远找不回（找回接口拿不到地址，直接 409）。
+    // 豆包 CDN 真实地址形如 https://xxx/video/tos/cn/.../?...&mime_type=video_mp4
+    // 且无水印地址带 lr=unwatermarked，并不以 .mp4 结尾，这些形态都必须算有效。
     this.db.prepare(`
       UPDATE api_requests
       SET
         status = 'failed',
         message = '历史结果不包含有效的去水印 MP4',
-        raw_video_url = NULL,
-        clean_video_url = NULL,
-        output_video_path = NULL,
         updated_at = ?,
         finished_at = COALESCE(finished_at, ?)
       WHERE status = 'success'
@@ -1262,6 +1264,11 @@ export class AppDatabase {
         AND NOT (
           LOWER(COALESCE(clean_video_url, '')) LIKE '%.mp4%'
           OR LOWER(COALESCE(clean_video_url, '')) LIKE '%video_mp4%'
+          OR LOWER(COALESCE(clean_video_url, '')) LIKE '%/video/tos/%'
+          OR LOWER(COALESCE(clean_video_url, '')) LIKE '%unwatermarked%'
+          OR LOWER(COALESCE(raw_video_url, '')) LIKE '%.mp4%'
+          OR LOWER(COALESCE(raw_video_url, '')) LIKE '%video_mp4%'
+          OR LOWER(COALESCE(raw_video_url, '')) LIKE '%/video/tos/%'
           OR LOWER(COALESCE(output_video_path, '')) LIKE '%.mp4'
         )
     `).run(now(), now());

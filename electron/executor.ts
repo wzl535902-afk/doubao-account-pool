@@ -596,7 +596,7 @@ export class DoubaoExecutor {
 
       if (!generationResult.cleanVideoUrl) {
         throw new Error(
-          `视频已生成，但未能解析无水印原片地址${generationResult.shareFailureReason ? `（兜底分享：${generationResult.shareFailureReason}）` : ""}`
+          `视频已生成，但无水印原片解析失败（已整页重载重试 2 次）${generationResult.shareFailureReason ? `；分享兜底：${generationResult.shareFailureReason}` : ""}`
         );
       }
 
@@ -2544,19 +2544,23 @@ async function findGeneratedConversationAndCopyShare(
     generatedMatchCount += 1;
     recoveryDirectVideoUrl ||= pageState.directVideoUrl || null;
 
-    // 自研去水印优先：直接从页面数据解析无水印原片
-    // 整页重载后再解析（SPA 流式消息无 fallback_api，2026-10-14 实测）
-    try {
-      const recoveryUrl = win.webContents.getURL();
-      if (/\/chat\/\d{6,}/.test(recoveryUrl)) {
-        await loadUrl(win, recoveryUrl);
-        await waitForDoubaoPageSettled(win);
-        await wait(1200);
+    // 自研去水印（无水印原片直解）：SPA 流式消息第一次经常还没把 fallback_api
+    // 写进页面，单次失败就整单判死太亏。整页重载重试最多 2 轮（第二轮等更久）。
+    let recoveryNomark = null;
+    for (let nomarkAttempt = 1; nomarkAttempt <= 2; nomarkAttempt += 1) {
+      try {
+        const recoveryUrl = win.webContents.getURL();
+        if (/\/chat\/\d{6,}/.test(recoveryUrl)) {
+          await loadUrl(win, recoveryUrl);
+          await waitForDoubaoPageSettled(win);
+          await wait(nomarkAttempt === 1 ? 1200 : 2600);
+        }
+      } catch {
+        /* 忽略，用现页面兜底 */
       }
-    } catch {
-      /* 忽略，用现页面兜底 */
+      recoveryNomark = await resolveNomarkCleanVideo(win).catch(() => null);
+      if (recoveryNomark?.url) break;
     }
-    const recoveryNomark = await resolveNomarkCleanVideo(win).catch(() => null);
     if (recoveryNomark?.url) {
       return {
         conversationUrl: candidate,
