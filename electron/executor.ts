@@ -2545,7 +2545,26 @@ async function findGeneratedConversationAndCopyShare(
       }
       await wait(700);
     }
-    if (!matchedPrompt) continue;
+    if (!matchedPrompt) {
+      // 取证：把打开后的真实页面状态带回去，否则「提示词匹配 0 条」永远查不出原因
+      // （常见：会话被删、打开的是别的账号的会话、页面弹了登录/验证、正文是空骨架）。
+      const probe = await runPageScript<{ title: string; url: string; head: string; textLen: number }>(
+        win,
+        `(() => {
+           const text = document.body?.innerText || "";
+           return {
+             title: document.title || "",
+             url: location.href,
+             head: text.replace(/\\s+/g, " ").slice(0, 120),
+             textLen: text.length
+           };
+         })()`
+      ).catch(() => null);
+      shareFailureReason = probe
+        ? `会话页未匹配到提示词（标题「${probe.title}」正文${probe.textLen}字：${probe.head}｜${probe.url}）`
+        : "会话页未匹配到提示词（页面取证失败）";
+      continue;
+    }
     promptMatchCount += 1;
 
     const pageState = await waitForGeneratedVideoCard(win, VIDEO_CARD_WAIT_MS);
