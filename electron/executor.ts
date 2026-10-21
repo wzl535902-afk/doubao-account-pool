@@ -2518,19 +2518,32 @@ async function findGeneratedConversationAndCopyShare(
       console.warn("跳过无法加载的豆包历史对话", candidate, error);
       continue;
     }
-    await wait(600);
+    // 豆包会话是虚拟滚动 SPA：只等 600ms 就读 innerText，长会话消息还没挂到 DOM，
+    // 会把「视频明明在」判成「提示词匹配 0 条」（找回失败的主因之一）。
+    await waitForDoubaoPageSettled(win).catch(() => {});
+    await wait(1200);
     await dismissDoubaoDesktopDownloadPrompt(win);
 
     let pageText = "";
     let matchedPrompt = false;
-    for (let attempt = 0; attempt < 4; attempt += 1) {
+    for (let attempt = 0; attempt < 14; attempt += 1) {
       pageText = await runPageScript<string>(win, `document.body?.innerText || ""`);
       const normalizedPageText = normalizeComparableText(pageText);
       const signatureMatches = signatures.filter((signature) => normalizedPageText.includes(signature)).length;
       matchedPrompt = normalizedPageText.includes(normalizedPrompt)
         || signatureMatches >= requiredSignatureMatches;
       if (matchedPrompt) break;
-      await wait(350);
+      // 前几轮纯等待（流式渲染）；之后每轮滚到底触发懒加载再读。
+      if (attempt >= 3) {
+        await runPageScript(win, `(() => {
+          const sc = document.scrollingElement || document.body;
+          sc.scrollTop = sc.scrollHeight;
+          const panes = Array.from(document.querySelectorAll('[class*="scroll"], [data-testid*="chat"]'));
+          for (const pane of panes) { try { pane.scrollTop = pane.scrollHeight; } catch {} }
+          window.dispatchEvent(new Event("scroll"));
+        })()`).catch(() => {});
+      }
+      await wait(700);
     }
     if (!matchedPrompt) continue;
     promptMatchCount += 1;
