@@ -2592,7 +2592,26 @@ async function findGeneratedConversationAndCopyShare(
     promptMatchCount += 1;
 
     const pageState = await waitForGeneratedVideoCard(win, VIDEO_CARD_WAIT_MS);
-    if (!pageState.generated || pageState.failed) continue;
+    if (!pageState.generated || pageState.failed) {
+      // 取证：提示词已经匹配到了，却判定「未生成」。把页面里的 <video> 数量、
+      // 首个视频地址、正文末尾带回，才能区分「视频真被删了」还是「检测器选择器失配」。
+      const probe = await runPageScript<{ videos: number; src: string | null; tail: string }>(
+        win,
+        `(() => {
+           const vs = Array.from(document.querySelectorAll("video"));
+           const first = vs[0];
+           return {
+             videos: vs.length,
+             src: (first && (first.currentSrc || first.src)) || null,
+             tail: (document.body?.innerText || "").replace(/\\s+/g, " ").slice(-160)
+           };
+         })()`
+      ).catch(() => null);
+      shareFailureReason = probe
+        ? `未确认生成（页面 video 标签 ${probe.videos} 个${probe.src ? `，src=${probe.src.slice(0, 80)}` : ""}；正文末尾：${probe.tail}）`
+        : "未确认生成（页面取证失败）";
+      continue;
+    }
     if (pageState.videoCardCount <= 0) {
       shareFailureReason = "匹配对话已完成，但视频卡片仍未渲染";
       continue;
