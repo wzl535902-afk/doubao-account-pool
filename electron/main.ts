@@ -561,6 +561,16 @@ class LocalApiServer {
           sendJson(response, 409, { error: "request has no assigned account", code: "NOTHING_TO_RECOVER" });
           return;
         }
+        if (!this.database.getAccount(apiRequest.accountId)) {
+          // 号池重导账号后，老请求的 account_id 会变成孤儿引用：这段对话已经不在
+          // 任何现存账号的会话里，找回物理上不可能。必须明确告知，而不是 500。
+          sendJson(response, 409, {
+            error: "提交该视频的豆包账号已被删除，无法找回结果；请用现有账号重新提交",
+            code: "ACCOUNT_REMOVED",
+            request: requestView(apiRequest)
+          });
+          return;
+        }
         this.requestExecutor.enqueueRecovery(requestId);
         this.database.appendOperationLog({
           requestId,

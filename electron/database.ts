@@ -1066,6 +1066,11 @@ export class AppDatabase {
 
   appendOperationLog(input: OperationLogCreateInput): OperationLog {
     this.pruneOperationLogs();
+    // 关联账号可能早被删掉了（重导号池后 account_id 成了孤儿引用），
+    // 直接写会撞 operation_logs.account_id 外键，整条接口直接 500——
+    // 客户点「找回视频」点不动就是这么来的。账号不存在就落 NULL。
+    const accountId =
+      input.accountId != null && this.getAccount(input.accountId) ? input.accountId : null;
     const timestamp = now();
     const result = this.db.prepare(`
       INSERT INTO operation_logs (
@@ -1079,7 +1084,7 @@ export class AppDatabase {
       ) VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.requestId || null,
-      input.accountId ?? null,
+      accountId,
       input.action,
       input.status || "info",
       input.message,
