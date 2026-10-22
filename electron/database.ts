@@ -130,7 +130,10 @@ const DEFAULT_SETTINGS: AppSettings = {
   apiPort: 17888,
   apiKey: "local-doubao-key",
   executorEnabled: true,
-  showExecutorWindow: false,
+  // 默认开可见窗口：豆包页面的视频卡片只在窗口真正上屏渲染时才挂载。
+  // 幽灵窗口（alpha=0 或移出屏幕）下卡片永远是 0 条，执行器就把"豆包已生成"判成"未生成"
+  // （客户 2026-10-22 实测：同一单幽灵窗口失败、可见窗口立即拿到无水印地址）。
+  showExecutorWindow: true,
   autoCloseExecutorWindow: true,
   doubaoChatUrl: "https://www.doubao.com/chat",
   defaultModel: "seedance_2_0_mini",

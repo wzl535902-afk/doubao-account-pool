@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { BrowserWindow, clipboard } from "electron";
+import { BrowserWindow, clipboard, screen } from "electron";
 import type { AppDatabase } from "./database.js";
 import { AccountTaskScheduler } from "./account-scheduler.js";
 import {
@@ -959,18 +959,18 @@ export class DoubaoExecutor {
   private createExecutionWindow(account: Account, settings: AppSettings) {
     const titleName = account.remark || account.name;
     const visible = settings.showExecutorWindow;
-    // 豆包页面在 hidden 窗口下会降级（编辑器挂起、上传失败、视频卡片不渲染）：
-    // 默认用"幽灵窗口"——上屏正常渲染（保证视频卡片/媒体懒加载生效），
-    // 但对用户完全不可见且鼠标事件穿透（不挡任何点击）。
-    // 创建时 show:false + 初始 opacity:0，再 showInactive 上屏——避免
-    // "先可见一帧再 setOpacity(0)"的闪窗（2026-10-18 修）。
+    // 豆包页面在 hidden 窗口下会降级（编辑器挂起、上传失败、视频卡片不渲染）：用"幽灵窗口"上屏。
+    // 但 alpha=0 的窗口在部分环境下页面懒加载同样不触发——豆包视频卡片永远不挂载，执行器数到
+    // 0 条就判"未生成"（客户 2026-10-22 实例：豆包侧已有成片，找回/等待全部失败）。
+    // 改为「离屏 + 近乎全透明」：窗口按可见窗口渲染，只是被放到屏幕外，用户看不到。
+    const GHOST_POSITION = -20000;
     const win = new BrowserWindow({
       width: 1320,
       height: 860,
-      x: visible ? undefined : 0,
-      y: visible ? undefined : 0,
+      x: visible ? undefined : GHOST_POSITION,
+      y: visible ? undefined : GHOST_POSITION,
       show: false,
-      opacity: visible ? 1 : 0,
+      opacity: visible ? 1 : 0.01,
       focusable: visible,
       skipTaskbar: !visible,
       title: `豆包执行器 - ${titleName}`,
@@ -983,9 +983,8 @@ export class DoubaoExecutor {
       }
     });
     if (!visible) {
-      win.setOpacity(0);
       win.setIgnoreMouseEvents(true);
-      win.showInactive(); // 零透明度上屏：首帧即不可见，同时保证豆包页面不降级
+      win.showInactive(); // 离屏上屏：按可见窗口渲染（视频卡片懒加载生效），但不在屏幕内
     } else {
       win.show();
     }
@@ -2683,12 +2682,49 @@ async function findGeneratedConversationAndCopyShare(
   };
 }
 
+/** 把执行窗口临时挪到屏幕右下角（真实上屏）强制渲染，12 秒后挪回离屏位置。 */
+async function forceRenderOnScreen(win: BrowserWindow) {
+  if (win.isDestroyed()) return;
+  const bounds = win.getBounds();
+  let target = { x: 60, y: 60 };
+  try {
+    const area = screen.getPrimaryDisplay().workAreaSize;
+    target = {
+      x: Math.max(0, area.width - bounds.width - 40),
+      y: Math.max(0, area.height - bounds.height - 40)
+    };
+  } catch {
+    target = { x: 60, y: 60 };
+  }
+  try {
+    win.setBounds({ ...bounds, ...target });
+    win.showInactive();
+    win.webContents.invalidate();
+  } catch {
+    return;
+  }
+  await wait(12000);
+  if (win.isDestroyed()) return;
+  try {
+    win.setBounds({ ...bounds, x: -20000, y: -20000 });
+  } catch {
+    // 窗口已在销毁流程中，忽略
+  }
+}
+
 async function waitForGeneratedVideoCard(win: BrowserWindow, timeoutMs: number) {
   const startedAt = Date.now();
   let state = await inspectGenerationPage(win);
   let tick = 0;
+  let escalated = false;
   while (Date.now() - startedAt < timeoutMs) {
     if (state.failureMessage || (state.generated && state.videoCardCount > 0)) return state;
+    // 兜底：离屏窗口在个别环境下仍不触发懒加载（客户 2026-10-22：豆包已有成片，卡片 0 条）。
+    // 15 秒还一条卡片都没有，就把窗口临时挪到屏幕右下角真实上屏逼渲染，12 秒后挪回离屏位置。
+    if (!escalated && state.videoCardCount === 0 && Date.now() - startedAt > 15000) {
+      escalated = true;
+      await forceRenderOnScreen(win).catch(() => {});
+    }
     await wait(500);
     // 豆包会话是虚拟滚动：视频卡片在消息列表底部，不滚到底可能永远不进 DOM，
     // 表现为「提示词匹配到了、但确认已生成 0 条」→ 找回判死。每 3 秒滚一次。
